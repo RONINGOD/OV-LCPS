@@ -3,6 +3,7 @@ dataset:
     version: v1.0-mini
     path: /home/coisini/data/nuscenes
     sample_pkl_path: /home/coisini/data/nuscenes/nuscenes_pkl
+    fcclip_feature_path: /home/coisini/data/nuscenes_fcclip_features
     rotate_aug: True
     flip_aug: True
     max_volume_space: [ 100, 3.1415926, 3 ]
@@ -27,7 +28,7 @@ model:
     use_att: True
     model_load_path: null
     model_save_path: ./nusc_mini.pt
-    train_batch_size: 2
+    train_batch_size: 1
     val_batch_size: 2
     learning_rate: 0.004
     LR_MILESTONES: [100, 150,200]

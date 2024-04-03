@@ -382,7 +382,7 @@ class Nuscenes_pt(data.Dataset):
 
         return data_tuple
 
-class Open_Vocabulary_Nuscenes_pt(data.Dataset):
+class OV_Nuscenes_pt(data.Dataset):
     def __init__(self, data_path, split, cfgs, nusc, version, assync_compensation=True):
         with open("nuscenes.yaml", 'r') as stream:
             nuscenesyaml = yaml.safe_load(stream)

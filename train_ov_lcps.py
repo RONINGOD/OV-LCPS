@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR, CosineAnnea
 
 from utils.AppLogger import AppLogger
 from network.ptBEV import ptBEVnet
-from dataloader.dataset import collate_fn_BEV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt
+from dataloader.dataset import collate_fn_BEV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset
 from dataloader.eval_sampler import SequentialDistributedSampler
 from network.util.instance_post_processing import get_panoptic_segmentation
 from network.util.loss import PanopticLoss, PixelLoss
@@ -161,8 +161,8 @@ def main():
     else:
         raise NotImplementedError
 
-    train_dataset = spherical_dataset(train_pt_dataset, cfgs, ignore_label=0)
-    val_dataset = spherical_dataset(val_pt_dataset, cfgs, ignore_label=0, use_aug=False)
+    train_dataset = ov_spherical_dataset(train_pt_dataset, cfgs, ignore_label=0)
+    val_dataset = ov_spherical_dataset(val_pt_dataset, cfgs, ignore_label=0, use_aug=False)
 
     if args.local_rank != -1:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)

@@ -8,6 +8,7 @@ import math
 import numpy as np
 import numba as nb
 import yaml
+import torch
 import pickle
 from torch.utils import data
 from torchvision.transforms import transforms
@@ -15,7 +16,7 @@ from torchvision.transforms.functional import hflip, rotate, _get_inverse_affine
 from PIL import Image
 from dataloader.utils import PCDTransformTool, GaussianBlur, fetch_color
 from pyquaternion import Quaternion
-
+import torch_scatter
 from .process_panoptic_ori import PanopticLabelGenerator
 from .instance_augmentation import Instance_Augmentation, Cont_Mix_InstAugmentation
 
@@ -513,24 +514,6 @@ class OV_Nuscenes_pt(data.Dataset):
                 mask = np.logical_and(mask,pixel_coord[0,:]>0)
                 mask = np.logical_and(mask,pixel_coord[1,:]<im_height)
                 mask = np.logical_and(mask,pixel_coord[1,:]>0)
-                # pixel_coord[0, :] = pixel_coord[0, :] / (im.size[0] - 1.0) * 2.0 - 1.0  # width
-                # pixel_coord[1, :] = pixel_coord[1, :] / (im.size[1] - 1.0) * 2.0 - 1.0  # height
-                # pixel_coordinates.append(pixel_coord.T)
-
-                # Remove points that are either outside or behind the camera. Leave a margin of 1 pixel for aesthetic reasons.
-                # Also make sure points are at least 1m in front of the camera to avoid seeing the lidar points on the camera
-                # casing for non-keyframes which are slightly out of sync. 在相机视野里的
-                # mask = np.logical_and(mask, pixel_coord[0, :] > -1)
-                # mask = np.logical_and(mask, pixel_coord[0, :] < 1)
-                # mask = np.logical_and(mask, pixel_coord[1, :] > -1)
-                # mask = np.logical_and(mask, pixel_coord[1, :] < 1)
-                # detailed filter
-                # mask = np.logical_and(mask, points[:, 1] * self.cam_fov[idx][2] > 0)
-                # filtered by fov angle has been disbaled, 
-                # since bugs:the NuScenes Official doesn't release the camera fov
-                # coordinated at the vehicle center, but at the camera center
-                # mask = np.logical_and(mask, cosine_value > self.cam_fov[idx][0])
-                # mask = np.logical_and(mask, cosine_value < self.cam_fov[idx][1])
                 valid_mask[mask] = idx
                 masks.append(mask)
                 pixel_coordinates.append(pixel_coord.T)
@@ -562,10 +545,10 @@ class OV_Nuscenes_pt(data.Dataset):
             points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
             noise_mask = points_label == 0
             unseenmask = np.isin(points_label,self.unseen_class)
-            points_label[np.logical_xor(noise_mask,unseenmask)] = 17
-            data_tuple += (points_label.astype(np.uint8), panoptic_label)
+            points_label[noise_mask] = 17
+            data_tuple += (points_label.astype(np.uint8), panoptic_label,unseenmask)
         else:
-            data_tuple += (-1, -1)
+            data_tuple += (-1, -1,-1)
 
         # data_tuple = (points[:, :3], points[:, 3], points_label.astype(np.uint8), panoptic_label)
         if self.pix_fusion:
@@ -872,16 +855,17 @@ class ov_spherical_dataset(data.Dataset):
         'Generates one sample of data'
         # index = 8709
         data = self.point_cloud_dataset[index]
-        if len(data) == 5:
-            xyz, feat, token, labels, insts = data
+        if len(data) == 6:
+            xyz, feat, token, labels, insts,unseenmask = data # insts -> panoptic label
             fusion_tuple = None
             if len(feat.shape) == 1: feat = feat[..., np.newaxis]
-        elif len(data) == 6:
-            xyz, feat, token, labels, insts, fusion_tuple = data
+        elif len(data) == 7:
+            xyz, feat, token, labels, insts, unseenmask,fusion_tuple = data
             if len(feat.shape) == 1: feat = feat[..., np.newaxis]
         else:
             raise Exception('Return invalid data tuple')
         
+        seenmask = np.logical_not(unseenmask)
 
         if type(labels)==np.ndarray:
             if len(labels.shape) == 1: labels = labels[..., np.newaxis]
@@ -965,6 +949,7 @@ class ov_spherical_dataset(data.Dataset):
         min_bound = min_bound + [1e-8, 1e-8, 1e-8]
         if (intervals == 0).any(): print("Zero interval!")
         grid_ind = (np.floor((np.clip(xyz_pol, min_bound, max_bound) - min_bound) / intervals)).astype(int) # 每个点是属于哪个格子
+        unique_grid_ind,point2voxel_map,voxel2point_map = np.unique(grid_ind,axis=0,return_index=True,return_inverse=True) # 体素化后去重的索引
 
         # 每个网格的起始角落在真实坐标系下的绝对位置
         dim_array = np.ones(len(self.grid_size) + 1, int)
@@ -972,49 +957,43 @@ class ov_spherical_dataset(data.Dataset):
         voxel_position = np.indices(self.grid_size) * intervals.reshape(dim_array) + min_bound.reshape(dim_array)
         
         # 索引clip vision features
-        _, pixel_coordinates, masks, _, ori_clip_vision_channel = fusion_tuple    
+        _, pixel_coordinates, camera_masks, _, ori_clip_vision_channel = fusion_tuple    
         img_indices_channel = []
         point2img_index_channel = []
+        pts_instance_mask = insts[seenmask]
+        pts_semantic_mask = labels[seenmask]
         for idx in range(len(pixel_coordinates)):
             points_img = np.ascontiguousarray(pixel_coordinates[idx])
-            points_img = points_img[masks[idx]]
+            points_img = points_img[camera_masks[idx]]
             img_indices = np.fliplr(points_img.astype(np.int64))
-            point2img_index = np.arange(len(masks[idx]))[masks[idx]]
+            point2img_index = np.arange(len(camera_masks[idx]))[camera_masks[idx]]
             img_indices_channel.append(img_indices)
             point2img_index_channel.append(point2img_index)
+            pixel_coordinates[idx]
         
         if type(labels)==np.ndarray and type(insts)==np.ndarray:
             # 生成每个voxel的语义label，单个网格内采用最大投票
-            voxel_label = np.ones(self.grid_size, dtype=np.uint8) * self.ignore_label
-            current_grid = grid_ind[:np.size(labels)]
-            label_voxel_pair = np.concatenate([current_grid, labels], axis=1)
-            label_voxel_pair = label_voxel_pair[np.lexsort((current_grid[:, 0], current_grid[:, 1], current_grid[:, 2])), :]
-            voxel_label = nb_process_label(np.copy(voxel_label), label_voxel_pair)
+            num_points = pts_instance_mask.shape[0]
+            _,seen_unique_indices, unique_indices_inverse = np.unique(grid_ind[seenmask[:,0]], return_inverse=True,return_index=True, axis=0)
+            unq_instance_labels = np.unique(pts_instance_mask, axis=0).astype(np.int32)
+            sort_instance_labels = np.zeros(pts_instance_mask.shape).astype(np.int32)
+            # map instance labels to [1 - the number of instances]
+            i = 1
+            ins2sem = np.zeros((len(unq_instance_labels),)).astype(np.int32)
+            for u in unq_instance_labels:
+                valid = pts_instance_mask == u
+                sort_instance_labels[valid] = i
+                ins2sem[i - 1] = pts_semantic_mask[valid][0]
+                i = i + 1
+            flatten_inst_labels = np.zeros(
+                    (num_points, i))  # i: instance number+1(background)
+            flatten_inst_labels[list(range(0, num_points)),
+                                sort_instance_labels[list(range(0, num_points))]] += 1 # 前景背景就分离了
+            flatten_inst_label_sum = torch_scatter.scatter_sum(
+                    torch.from_numpy(flatten_inst_labels), torch.from_numpy(unique_indices_inverse), dim=0).numpy() # 每个点对应实例点数量
+            voxel_instance_labels = np.argmax(flatten_inst_label_sum, axis=1)
+            voxel_semantic_labels = ins2sem[voxel_instance_labels - 1]
 
-            # 生成前景点的mask，insts为0的点要单独特判一下，可能是有个别前景物体的点被标记为了insts为0
-            mask = np.zeros_like(labels, dtype=bool)
-            for label in self.point_cloud_dataset.thing_list:
-                # mask[labels == label] = True
-                mask[np.logical_and(labels == label, insts != 0)] = True
-
-            # 生成每个voxel的实例insts id，单个网格内采用最大投票
-            voxel_inst = insts[mask].squeeze()
-            unique_inst = np.unique(voxel_inst)
-            unique_inst_dict = {label: idx + 1 for idx, label in enumerate(unique_inst)}
-            if voxel_inst.size > 1:
-                voxel_inst = np.vectorize(unique_inst_dict.__getitem__)(voxel_inst)
-                # process panoptic
-                processed_inst = np.ones(self.grid_size[:2], dtype=np.uint8) * self.ignore_label
-                inst_voxel_pair = np.concatenate([current_grid[mask[:, 0], :2], voxel_inst[..., np.newaxis]], axis=1)
-                inst_voxel_pair = inst_voxel_pair[np.lexsort((current_grid[mask[:, 0], 0], current_grid[mask[:, 0], 1])), :]
-                processed_inst = nb_process_inst(np.copy(processed_inst), inst_voxel_pair)
-            else:
-                # processed_inst = np.zeros([480, 360])
-                processed_inst = np.zeros([self.grid_size[0], self.grid_size[1]])
-
-            center, center_points, offset = self.panoptic_proc(insts[mask], xyz[:np.size(labels)][mask[:, 0]],
-                                                            processed_inst, voxel_position[:2, :, :, 0],
-                                                            unique_inst_dict, min_bound, intervals)
 
         # center data on each voxel for PTnet
         voxel_centers = (grid_ind.astype(np.float32) + 0.5) * intervals + min_bound
@@ -1035,27 +1014,27 @@ class ov_spherical_dataset(data.Dataset):
         return_dict['rotate_deg'] = rotate_deg
         
         if type(labels) == np.ndarray and type(insts) == np.ndarray:
-            return_dict['voxel_label'] = voxel_label
-            return_dict['gt_center'] = center
-            return_dict['gt_offset'] = offset
-            return_dict['inst_map_sparse'] = processed_inst != 0
-            return_dict['bev_mask'] = bev_mask
-            return_dict['pt_sem_label'] = labels
-            return_dict['pt_ins_label'] = insts
+            return_dict['voxel_semantic_labels'] = voxel_semantic_labels
+            return_dict['voxel_instance_labels'] = voxel_instance_labels
+            return_dict['voxel2point_map'] = voxel2point_map
+            return_dict['seenmask'] = seenmask
+            return_dict['seen_unique_indices'] = seen_unique_indices
+            # return_dict['gt_center'] = center
+            # return_dict['gt_offset'] = offset
+            # return_dict['inst_map_sparse'] = processed_inst != 0
+            # return_dict['bev_mask'] = bev_mask
+            # return_dict['pt_sem_label'] = labels
+            # return_dict['pt_ins_label'] = insts
 
-        if len(data) == 6:
-            return_dict['camera_channel'] = fusion_tuple[0]
-            return_dict['pixel_coordinates'] = fusion_tuple[1]
-            return_dict['masks'] = fusion_tuple[2]
-            return_dict['valid_mask'] = fusion_tuple[3]
-            return_dict['ori_camera_channel'] = fusion_tuple[4]
+        if len(data) == 7:
+            # return_dict['camera_channel'] = fusion_tuple[0]
+            return_dict['pixel_coordinates'] = pixel_coordinates
+            # return_dict['masks'] = fusion_tuple[2]
+            # return_dict['valid_mask'] = fusion_tuple[3]
+            # return_dict['ori_camera_channel'] = fusion_tuple[4]
             return_dict['ori_clip_vision_channel'] = ori_clip_vision_channel
             return_dict['img_indices_channel'] = img_indices_channel
             return_dict['point2img_index_channel'] = point2img_index_channel           
-            if type(labels) == np.ndarray and type(insts) == np.ndarray:
-                point_with_pix_mask = return_dict['valid_mask'] > -1
-                # image labels projected by points
-                return_dict['im_label'] = return_dict['pt_sem_label'][point_with_pix_mask]
 
         return return_dict
 
@@ -1076,6 +1055,21 @@ def nb_process_label(processed_label, sorted_label_voxel_pair):
     processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = np.argmax(counter)
     return processed_label
 
+@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])', cache=True, parallel=False)
+def nb_process_inst_ov(processed_inst, sorted_inst_voxel_pair):
+    label_size = 256
+    counter = np.zeros((label_size,), dtype=np.uint16)
+    counter[sorted_inst_voxel_pair[0, 3]] = 1
+    cur_sear_ind = sorted_inst_voxel_pair[0, :3]
+    for i in range(1, sorted_inst_voxel_pair.shape[0]):
+        cur_ind = sorted_inst_voxel_pair[i, :3]
+        if not np.all(np.equal(cur_ind, cur_sear_ind)):
+            processed_inst[cur_sear_ind[0], cur_sear_ind[1]] = np.argmax(counter)
+            counter = np.zeros((label_size,), dtype=np.uint16)
+            cur_sear_ind = cur_ind
+        counter[sorted_inst_voxel_pair[i, 3]] += 1
+    processed_inst[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[1]] = np.argmax(counter)
+    return processed_inst
 
 @nb.jit('u1[:,:](u1[:,:],i8[:,:])', cache=True, parallel=False)
 def nb_process_inst(processed_inst, sorted_inst_voxel_pair):
@@ -1092,7 +1086,6 @@ def nb_process_inst(processed_inst, sorted_inst_voxel_pair):
         counter[sorted_inst_voxel_pair[i, 2]] += 1
     processed_inst[cur_sear_ind[0], cur_sear_ind[1]] = np.argmax(counter)
     return processed_inst
-
 
 def collate_fn_BEV(data):
     return_dict = {}
@@ -1113,6 +1106,14 @@ def collate_fn_BEV(data):
     if 'ori_camera_channel' in return_dict:
         return_dict['ori_camera_channel'] = np.stack(return_dict['ori_camera_channel'])
 
+    return return_dict
+
+def collate_fn_OV(data):
+    return_dict = {}
+    for i, k in enumerate(data[0]):
+        return_dict[k] = [d[k] for d in data]
+    if 'ori_clip_vision_channel' in return_dict:
+        return_dict['ori_clip_vision_channel'] = np.stack(return_dict['ori_clip_vision_channel'])
     return return_dict
 
 

@@ -17,8 +17,8 @@ from nuscenes import NuScenes
 from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR, CosineAnnealingWarmRestarts
 
 from utils.AppLogger import AppLogger
-from network.ptBEV import ptBEVnet
-from dataloader.dataset import collate_fn_BEV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset
+from network.PFC import PFC
+from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset
 from dataloader.eval_sampler import SequentialDistributedSampler
 from network.util.instance_post_processing import get_panoptic_segmentation
 from network.util.loss import PanopticLoss, PixelLoss
@@ -111,10 +111,10 @@ def main():
     # 初始化类别名称和数量，不包括noise类。
     unique_label, unique_label_str = collate_dataset_info(cfgs)
 
-    # 加noise类
+    # 加noise类 
     nclasses = len(unique_label) + 1
 
-    my_model = ptBEVnet(cfgs, nclasses)
+    my_model = PFC(cfgs, nclasses)
 
     # 加载模型
     if args.resume:
@@ -169,26 +169,26 @@ def main():
         val_sampler = SequentialDistributedSampler(val_dataset, val_batch_size)
         train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                            batch_size=train_batch_size,
-                                                           collate_fn=collate_fn_BEV,
+                                                           collate_fn=collate_fn_OV,
                                                            sampler=train_sampler,
                                                            pin_memory=True,
                                                            num_workers=num_worker)
         val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
                                                          batch_size=val_batch_size,
-                                                         collate_fn=collate_fn_BEV,
+                                                         collate_fn=collate_fn_OV,
                                                          sampler=val_sampler,
                                                          pin_memory=True,
                                                          num_workers=num_worker)
     else:
         train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                            batch_size=train_batch_size,
-                                                           collate_fn=collate_fn_BEV,
+                                                           collate_fn=collate_fn_OV,
                                                            shuffle=True,
                                                            pin_memory=True,
                                                            num_workers=num_worker)
         val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
                                                          batch_size=val_batch_size,
-                                                         collate_fn=collate_fn_BEV,
+                                                         collate_fn=collate_fn_OV,
                                                          shuffle=False,
                                                          pin_memory=True,
                                                          num_workers=num_worker)
@@ -436,26 +436,29 @@ def main():
         for i_iter, train_dict in enumerate(train_dataset_loader):
             # training data process
             my_model.train()
-            train_dict['voxel_label'] = SemKITTI2train(torch.from_numpy(train_dict['voxel_label']))
-            train_dict['voxel_label'] = train_dict['voxel_label'].type(torch.LongTensor).cuda()
-            train_dict['gt_center'] = torch.from_numpy(train_dict['gt_center']).cuda()
-            train_dict['gt_offset'] = torch.from_numpy(train_dict['gt_offset']).cuda()
-            train_dict['bev_mask'] = torch.from_numpy(train_dict['bev_mask']).cuda()
-            train_dict['inst_map_sparse'] = torch.from_numpy(train_dict['inst_map_sparse']).cuda()
+
+            train_dict['voxel2point_map'] = [torch.from_numpy(i).cuda() for i in train_dict['voxel2point_map']]
+            train_dict['seenmask'] = [torch.from_numpy(i).cuda() for i in train_dict['seenmask']]
+            train_dict['seen_unique_indices'] = [torch.from_numpy(i).cuda() for i in train_dict['seen_unique_indices']]
             train_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in train_dict['pol_voxel_ind']]
-            train_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
-                                        train_dict['return_fea']]
+            # train_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
+            #                             train_dict['return_fea']]
 
             if pix_fusion:
-                train_dict['camera_channel'] = torch.from_numpy(train_dict['camera_channel']).float().cuda()
+                # train_dict['camera_channel'] = torch.from_numpy(train_dict['camera_channel']).float().cuda()
                 train_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in train_dict['pixel_coordinates']]
-                train_dict['masks'] = [torch.from_numpy(i).cuda() for i in train_dict['masks']]
-                train_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['valid_mask']]
-                train_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in train_dict['im_label']], dim=0)).cuda()
+                train_dict['ori_clip_vision_channel'] = torch.from_numpy(train_dict['ori_clip_vision_channel']).cuda()
+                # train_dict['img_indices_channel'] = [[torch.from_numpy(i).cuda() for i in split ] for split in train_dict['img_indices_channel']]
+                # train_dict['point2img_index_channel'] = [[torch.from_numpy(i) for i in split ] for split in train_dict['point2img_index_channel']]
+                # train_dict['masks'] = [torch.from_numpy(i).cuda() for i in train_dict['masks']]
+                # train_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['valid_mask']]
+                # train_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in train_dict['im_label']], dim=0)).cuda()
 
 
             sem_prediction, center, offset, instmap, softmax_pix_logits, _ = my_model(train_dict)
-
+            
+            train_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
+            train_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in train_dict['voxel_instance_labels']]
             loss = loss_fn(sem_prediction, center, offset,instmap, train_dict['voxel_label'], train_dict['gt_center'],
                                      train_dict['gt_offset'],train_dict['inst_map_sparse'].long(),train_dict['bev_mask'].squeeze(1).long())
             sem_loss = np.nanmean(loss_fn.loss_dict['semantic_loss'])

@@ -126,3 +126,4 @@ class PixelLoss(torch.nn.Module):
         if self.save_loss:
             self.loss_dict['pix_loss'].append(torch.tensor(pix_sem_loss, device="cpu").item())
         return pix_sem_loss
+

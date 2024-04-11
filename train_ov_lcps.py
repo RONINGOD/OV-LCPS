@@ -35,6 +35,11 @@ def SemKITTI2train(label):
     else:
         return SemKITTI2train_single(label)
 
+def transform_map(class_list):
+    return {i:class_list[i] for i in range(len(class_list))}
+
+def inverse_transform(learning_map):
+    return {v: k for k, v in learning_map.items()} 
 
 def SemKITTI2train_single(label):
     return label - 1  # uint8 trick, transform null area 0->255
@@ -110,7 +115,7 @@ def main():
     grad_accumu = 1
     # 初始化类别名称和数量，不包括noise类。
     unique_label, unique_label_str = collate_dataset_info(cfgs)
-
+    
     # 加noise类 
     nclasses = len(unique_label) + 1
 
@@ -199,7 +204,7 @@ def main():
         learning_map = nuscenesyaml['learning_map']
 
     # training
-    epoch = 0
+    epoch = 1
     best_val_PQ = 0
     start_training = False
     my_model.train()
@@ -222,7 +227,7 @@ def main():
             pbar_val = tqdm(total=len(val_dataset_loader))
             if args.local_rank > 0:
                 save_dict = {
-                    'item1': [],
+                    'item1': [],          
                     'item2': [],
                     'item3': [],
                     'item4': [],
@@ -231,51 +236,42 @@ def main():
 
             if args.local_rank != -1:
                 torch.distributed.barrier()
-
+            my_model.thing_class = SemKITTI2train(val_pt_dataset.thing_list)
+            my_model.stuff_class = SemKITTI2train(val_pt_dataset.stuff_list)
+            my_model.novel_class = SemKITTI2train(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list)
+            my_model.base_class = SemKITTI2train(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list)
+            my_model.thing_map = transform_map(SemKITTI2train(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list))
+            my_model.thing_inverse_map = inverse_transform(my_model.thing_map)
+            my_model.novel_class = SemKITTI2train(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list)
+            my_model.total_map = my_model.thing_map
+            base_num = len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list)
+            for i,c in enumerate(my_model.novel_class):
+                my_model.total_map[base_num+i] = c 
+            my_model.total_inverse_map = inverse_transform(my_model.total_map)   
+            my_model.categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(len(my_model.base_class), True, dtype=bool),np.full(len(my_model.novel_class),False,dtype=bool))))
+            my_model.map_stuff_class = list(np.vectorize(my_model.total_inverse_map.__getitem__)(my_model.stuff_class))
+            my_model.map_thing_class = list(np.vectorize(my_model.total_inverse_map.__getitem__)(my_model.thing_class))
             with torch.no_grad():
                 for i_iter_val, val_dict in enumerate(val_dataset_loader):
-                    val_dict['voxel_label'] = SemKITTI2train(torch.from_numpy(val_dict['voxel_label']))
-                    val_dict['voxel_label'] = val_dict['voxel_label'].type(torch.LongTensor).cuda()
-                    val_dict['gt_center'] = torch.from_numpy(val_dict['gt_center']).cuda()
-                    val_dict['gt_offset'] = torch.from_numpy(val_dict['gt_offset']).cuda()
-                    val_dict['inst_map_sparse'] = torch.from_numpy(val_dict['inst_map_sparse']).cuda()
-                    val_dict['bev_mask'] = torch.from_numpy(val_dict['bev_mask']).cuda()
+                    val_dict['voxel2point_map'] = [torch.from_numpy(i) for i in val_dict['voxel2point_map']]
+                    val_dict['point2voxel_map'] = [torch.from_numpy(i) for i in val_dict['point2voxel_map']]
+                    val_dict['seenmask'] = [torch.from_numpy(i).cuda() for i in val_dict['seenmask']]
+                    val_dict['seen_unique_indices'] = [torch.from_numpy(i).cuda() for i in val_dict['seen_unique_indices']]
                     val_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in val_dict['pol_voxel_ind']]
-                    val_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
-                                                val_dict['return_fea']]
-
+                    val_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in val_dict['voxel_semantic_labels']]
+                    val_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in val_dict['voxel_instance_labels']]
                     if pix_fusion:
-                        val_dict['camera_channel'] = torch.from_numpy(val_dict['camera_channel']).cuda()
-                        val_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in
-                                                            val_dict['pixel_coordinates']]
-                        val_dict['masks'] = [torch.from_numpy(i).cuda() for i in val_dict['masks']]
-                        val_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in val_dict['valid_mask']]
-                        val_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in val_dict['im_label']], dim=0)).cuda()
+                        val_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in val_dict['pixel_coordinates']]
+                        val_dict['ori_clip_vision_channel'] = torch.from_numpy(val_dict['ori_clip_vision_channel']).cuda()
+                        val_dict['text_features'] = torch.from_numpy(val_dict['text_features']).cuda()
 
-                    predict_labels, center, offset, instmap, _, cam = my_model(val_dict)
-
-                    predict_labels_sem = torch.argmax(predict_labels, dim=1)
-                    predict_labels_sem = predict_labels_sem.cpu().detach().numpy()
-                    predict_labels_sem = predict_labels_sem + 1
-
-                    val_grid = [i.cpu().numpy() for i in val_dict['pol_voxel_ind']]
+                    predict_labels_sem, pts_instance_preds = my_model(val_dict)
+                    predict_labels_sem = [sem + 1 for sem in predict_labels_sem]
+                    val_grid = val_dict['pol_voxel_ind']
                     val_pt_labels = val_dict['pt_sem_label']
                     val_pt_inst = val_dict['pt_ins_label']
-
                     for count, i_val_grid in enumerate(val_grid):
-                        # get foreground_mask
-                        for_mask = torch.zeros(1, grid_size[0], grid_size[1], grid_size[2], dtype=torch.bool).cuda()
-                        for_mask[0, val_grid[count][:, 0], val_grid[count][:, 1], val_grid[count][:, 2]] = True
-                        # post processing
-                        panoptic_labels, center_points = get_panoptic_segmentation(instmap[count],
-                            torch.unsqueeze(predict_labels[count], 0), torch.unsqueeze(center[count], 0),
-                            torch.unsqueeze(offset[count], 0),
-                            val_pt_dataset.thing_list, threshold=cfgs['model']['post_proc']['threshold'],
-                            nms_kernel=cfgs['model']['post_proc']['nms_kernel'],
-                            top_k=cfgs['model']['post_proc']['top_k'], polar=True, foreground_mask=for_mask)
-                        panoptic_labels = panoptic_labels.cpu().detach().numpy().astype(np.int32)
-                        panoptic = panoptic_labels[0, val_grid[count][:, 0], val_grid[count][:, 1], val_grid[count][:, 2]]
-
+                        panoptic = pts_instance_preds[count]
                         # 语义分割预测出是前景类别，但是全景分割预测它是背景(全景ID预测为0)，当作noise处理
                         if datasetname == 'SemanticKitti':
                             panoptic_mask1 = (panoptic <= 8) & (panoptic > 0)
@@ -302,7 +298,7 @@ def main():
                                                 sem_gt, inst_gt)
                             # PQ, SQ, RQ, class_all_PQ, class_all_SQ, class_all_RQ = evaluator.getPQ() # for debug
                             sem_hist_list.append(fast_hist_crop(
-                                predict_labels_sem[count, val_grid[count][:, 0], val_grid[count][:, 1], val_grid[count][:, 2]],
+                                predict_labels_sem[count],
                                 val_pt_labels[count],
                                 unique_label))
                         else:
@@ -311,7 +307,7 @@ def main():
                             save_dict['item3'].append(val_pt_labels[count])
                             save_dict['item4'].append(val_pt_inst[count])
                             save_dict['item5'].append(fast_hist_crop(
-                                predict_labels_sem[count, val_grid[count][:, 0], val_grid[count][:, 1], val_grid[count][:, 2]],
+                                predict_labels_sem[count],
                                 val_pt_labels[count],
                                 unique_label))
                         
@@ -432,47 +428,49 @@ def main():
             print(f"Epoch {epoch} => Start Training...")
         if args.local_rank != -1:
             train_sampler.set_epoch(epoch)
+        my_model.thing_class = SemKITTI2train(train_pt_dataset.thing_list)
+        my_model.stuff_class = SemKITTI2train(train_pt_dataset.stuff_list)
+        my_model.novel_class = SemKITTI2train(train_pt_dataset.novel_thing_list+train_pt_dataset.novel_stuff_list)
+        my_model.thing_map = transform_map(my_model.thing_class+my_model.stuff_class)
+        my_model.thing_inverse_map = inverse_transform(my_model.thing_map)
+        my_model.base_class = SemKITTI2train(train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list)
+        my_model.categroy_overlapping_mask = torch.from_numpy(np.isin(my_model.total_class,my_model.base_class))
+        # for i,c in enumerate(my_model.novel_class):
+        #     my_model.total_map[i+len()]
         pbar = tqdm(total=len(train_dataset_loader))
         for i_iter, train_dict in enumerate(train_dataset_loader):
             # training data process
             my_model.train()
-
-            train_dict['voxel2point_map'] = [torch.from_numpy(i).cuda() for i in train_dict['voxel2point_map']]
+            train_dict['voxel2point_map'] = [torch.from_numpy(i) for i in train_dict['voxel2point_map']]
+            train_dict['point2voxel_map'] = [torch.from_numpy(i) for i in train_dict['point2voxel_map']]
+            # train_dict['unique_grid_ind'] = [torch.from_numpy(i) for i in train_dict['unique_grid_ind']]
             train_dict['seenmask'] = [torch.from_numpy(i).cuda() for i in train_dict['seenmask']]
             train_dict['seen_unique_indices'] = [torch.from_numpy(i).cuda() for i in train_dict['seen_unique_indices']]
             train_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in train_dict['pol_voxel_ind']]
             # train_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
             #                             train_dict['return_fea']]
-
+            train_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
+            train_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in train_dict['voxel_instance_labels']]
             if pix_fusion:
                 # train_dict['camera_channel'] = torch.from_numpy(train_dict['camera_channel']).float().cuda()
                 train_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in train_dict['pixel_coordinates']]
                 train_dict['ori_clip_vision_channel'] = torch.from_numpy(train_dict['ori_clip_vision_channel']).cuda()
+                train_dict['text_features'] = torch.from_numpy(train_dict['text_features']).cuda()
+                # train_dict['thing_list'] = torch.from_numpy(train_dict['thing_list']).cuda()
                 # train_dict['img_indices_channel'] = [[torch.from_numpy(i).cuda() for i in split ] for split in train_dict['img_indices_channel']]
                 # train_dict['point2img_index_channel'] = [[torch.from_numpy(i) for i in split ] for split in train_dict['point2img_index_channel']]
                 # train_dict['masks'] = [torch.from_numpy(i).cuda() for i in train_dict['masks']]
                 # train_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['valid_mask']]
                 # train_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in train_dict['im_label']], dim=0)).cuda()
 
-
-            sem_prediction, center, offset, instmap, softmax_pix_logits, _ = my_model(train_dict)
-            
-            train_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
-            train_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in train_dict['voxel_instance_labels']]
-            loss = loss_fn(sem_prediction, center, offset,instmap, train_dict['voxel_label'], train_dict['gt_center'],
-                                     train_dict['gt_offset'],train_dict['inst_map_sparse'].long(),train_dict['bev_mask'].squeeze(1).long())
-            sem_loss = np.nanmean(loss_fn.loss_dict['semantic_loss'])
-            center_loss = np.nanmean(loss_fn.loss_dict['heatmap_loss'])
-            offset_loss = np.nanmean(loss_fn.loss_dict['offset_loss'])
-            instmap_loss = np.nanmean(loss_fn.loss_dict['instmap_loss'])
-
-            # SARA module, pixel loss
-            if softmax_pix_logits is not None:
-               sara_loss = pix_loss_fn(softmax_pix_logits, train_dict['im_label'])
-               loss = loss + sara_loss
-               pix_loss = np.nanmean(pix_loss_fn.loss_dict['pix_loss']) # defalut is 0
-
-            
+            loss_dict = my_model(train_dict)
+            loss = torch.sum(torch.stack(list(loss_dict.values())),dim=0)
+            sem_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k=='loss_ce'or k=='loss_lovasz'])          
+            cls_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k.startswith('loss_cls')])
+            mask_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k.startswith('loss_mask')])
+            dice_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k.startswith('loss_dice') and not k.startswith('loss_dice_pos')])            
+            dice_pos_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k.startswith('loss_dice_pos')])
+          
             loss_cpu = torch.tensor(loss, device="cpu").item()
             avg_loss = i_iter / (i_iter + 1) * avg_loss + 1 / (i_iter + 1) * loss_cpu
 
@@ -487,19 +485,12 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
             
-            if softmax_pix_logits is not None:
-                pbar.set_postfix({"sem_loss": sem_loss, 
-                                "center_loss": center_loss,
-                                "offset_loss": offset_loss,
-                                "instmap_loss": instmap_loss,
-                                "pix_loss": pix_loss,
-                                "avg_loss": avg_loss})
-            else:
-                pbar.set_postfix({"sem_loss": sem_loss, 
-                                "center_loss": center_loss,
-                                "offset_loss": offset_loss,
-                                "instmap_loss": instmap_loss,
-                                "avg_loss": avg_loss})
+            pbar.set_postfix({"sem_loss": sem_loss, 
+                            "class_loss": cls_loss,
+                            "mask_loss": mask_loss,
+                            "dice_loss": dice_loss,
+                            "dice_pos_loss": dice_pos_loss,
+                            "avg_loss": avg_loss})
             pbar.update(1)
             start_training = True
             global_iter += 1

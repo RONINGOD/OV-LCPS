@@ -101,6 +101,25 @@ thing_class: # thing class in panoptic segmentation
   15: False    # "manmade"
   16: False    # "vegetation"
 
+stuff_class: # thing class in panoptic segmentation
+  0: False      # "noise"
+  1: False     # "barrier"
+  2: False     # "bicycle"
+  3: False     # "bus"
+  4: False     # "car"
+  5: False    # "construction_vehicle"
+  6: False     # "motorcycle"
+  7: False     # "pedestrian"
+  8: False     # "traffic_cone"
+  9: False     # "trailer"
+  10: False    # "truck"
+  11: True    # "driveable_surface"
+  12: True    # "other_flat"
+  13: True    # "sidewalk"
+  14: True    # "terrain"
+  15: True    # "manmade"
+  16: True    # "vegetation"
+
 base_thing_class:
   0: False      # "noise"
   1: True     # "barrier"

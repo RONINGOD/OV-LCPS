@@ -411,8 +411,11 @@ class OV_Nuscenes_pt(data.Dataset):
         self.fcclip_features_path = cfgs['dataset']['fcclip_feature_path']
         self.split = split
         self.thing_list = [cl for cl, is_thing in nuscenesyaml['thing_class'].items() if is_thing]
+        self.stuff_list = [cl for cl, is_stuff in nuscenesyaml['stuff_class'].items() if is_stuff]
         self.base_thing_list = [cl for cl, is_thing in nuscenesyaml['base_thing_class'].items() if is_thing]
         self.base_stuff_list = [cl for cl, is_stuff in nuscenesyaml['base_stuff_class'].items() if is_stuff]
+        self.novel_thing_list = [cl for cl, is_thing in nuscenesyaml['novel_thing_class'].items() if is_thing]
+        self.novel_stuff_list = [cl for cl, is_stuff in nuscenesyaml['novel_stuff_class'].items() if is_stuff]
         self.nusc_infos = data['infos']
         self.data_path = data_path
         self.cfgs = cfgs
@@ -423,6 +426,7 @@ class OV_Nuscenes_pt(data.Dataset):
         if self.split =='train':
             self.thing_list = self.base_thing_list
             self.text_features = np.load(os.path.join(self.fcclip_features_path,'base_text_features.npy'))
+            self.stuff_list = self.base_stuff_list
             self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
         else:
             self.text_features = np.load(os.path.join(self.fcclip_features_path,'total_text_features.npy'))
@@ -818,7 +822,7 @@ class ov_spherical_dataset(data.Dataset):
 
         self.panoptic_proc = PanopticLabelGenerator(self.grid_size, sigma=cfgs['dataset']['gt_generator']['sigma'],
                                                     polar=True)
-        
+
         ### add instance augmentation ###
         if self.inst_aug:
             assert ("aug_type" in cfgs['dataset']['inst_aug'])
@@ -1012,11 +1016,20 @@ class ov_spherical_dataset(data.Dataset):
         return_dict['return_fea'] = return_fea
         return_dict['pol_voxel_ind'] = grid_ind
         return_dict['rotate_deg'] = rotate_deg
+        return_dict['thing_list'] = self.point_cloud_dataset.thing_list
+        return_dict['stuff_list'] = self.point_cloud_dataset.stuff_list
+        return_dict['text_features'] = self.point_cloud_dataset.text_features
+        return_dict['novel_thing_list'] = self.point_cloud_dataset.novel_thing_list
+        return_dict['novel_stuff_list'] = self.point_cloud_dataset.novel_stuff_list
+        return_dict['pt_sem_label'] = labels
+        return_dict['pt_ins_label'] = insts
         
         if type(labels) == np.ndarray and type(insts) == np.ndarray:
             return_dict['voxel_semantic_labels'] = voxel_semantic_labels
             return_dict['voxel_instance_labels'] = voxel_instance_labels
             return_dict['voxel2point_map'] = voxel2point_map
+            # return_dict['unique_grid_ind'] = unique_grid_ind
+            return_dict['point2voxel_map'] = point2voxel_map
             return_dict['seenmask'] = seenmask
             return_dict['seen_unique_indices'] = seen_unique_indices
             # return_dict['gt_center'] = center
@@ -1114,6 +1127,12 @@ def collate_fn_OV(data):
         return_dict[k] = [d[k] for d in data]
     if 'ori_clip_vision_channel' in return_dict:
         return_dict['ori_clip_vision_channel'] = np.stack(return_dict['ori_clip_vision_channel'])
+    if 'text_features' in return_dict:
+        return_dict['text_features'] = np.stack(return_dict['text_features'])
+    if 'thing_list' in return_dict:
+        return_dict['thing_list'] = np.stack(return_dict['thing_list'])
+    if 'stuff_list' in return_dict:
+        return_dict['stuff_list'] = np.stack(return_dict['stuff_list'])
     return return_dict
 
 

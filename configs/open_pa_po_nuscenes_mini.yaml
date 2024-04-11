@@ -30,10 +30,15 @@ model:
     scatter_points_mode: 'mean'
     model_save_path: ./nusc_mini.pt
     train_batch_size: 1
-    val_batch_size: 2
+    val_batch_size: 1
     learning_rate: 0.004
     LR_MILESTONES: [100, 150,200]
     IMAGE_SIZE: [900,1600]
+    deconv_layers: 3
+    pe_type: 'mpe'
+    query_embed_dims: 256
+    num_queries: 128
+    deconv_hidden_dim: 64
     fcclip_vision_dim: 1536
     fcclip_text_dim: 768
     LR_GAMMA: 0.5
@@ -43,6 +48,22 @@ model:
         threshold: 0.1
         nms_kernel: 5
         top_k: 100
+    loss_mask:
+            type: 'mmdet.FocalLoss'
+            use_sigmoid: True
+            gamma: 2.0
+            alpha: 0.25
+            reduction: 'mean'
+            loss_weight: 1.0
+    loss_dice:
+        type: 'mmdet.DiceLoss'
+        loss_weight: 2.0
+    loss_cls:
+        type: 'mmdet.FocalLoss'
+        use_sigmoid: True
+        gamma: 4.0
+        alpha: 0.25
+        loss_weight: 1.0
     center_loss: MSE
     offset_loss: L1
     center_loss_weight: 100

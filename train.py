@@ -199,7 +199,7 @@ def main():
         learning_map = nuscenesyaml['learning_map']
 
     # training
-    epoch = 0
+    epoch = 1
     best_val_PQ = 0
     start_training = False
     my_model.train()

@@ -6,11 +6,8 @@ import torch.nn.functional as F
 import numpy as np
 import numba as nb
 from mmcv.ops import DynamicScatter
-from network.cylinder_fea_generator import cylinder_fea
-from network.segmentator_3d_asymm_spconv import Asymm_3d_spconv
-from network.transformer_decoder import _Transformer_Decoder, get_classification_logits
+from network.transformer_decoder import _Transformer_Decoder, get_classification_logits, MaskPooling
 from mmengine.structures import InstanceData
-from network.BEV_Unet import BEV_Unet
 from network.util.mask_pseduo_sample import _MaskPseudoSampler
 from mmengine.model import kaiming_init, xavier_init
 from mmdet.models.utils import multi_apply
@@ -18,7 +15,11 @@ from mmdet.utils import reduce_mean
 from mmcv.cnn import build_activation_layer, build_norm_layer
 from mmcv.ops import SubMConv3d
 from mmdet3d.registry import MODELS,TASK_UTILS
+import open_clip
 
+def freeze_everything(model):
+    for param in model.parameters():
+        param.requires_grad = False
 
 class PFC(nn.Module):
 
@@ -28,10 +29,13 @@ class PFC(nn.Module):
                  num_decoder_layers=6,
                  score_thr = 0.4,
                  iou_thr = 0.8,
-                 geometric_ensemble_alpha = 0.4, # 0
-                 geometric_ensemble_beta = 0.8, # 1
+                 geometric_ensemble_alpha = 0.8, # 0
+                 geometric_ensemble_beta = 0.4, # 1
                  ignore_index = 16,
                  init_logit_scale = 4.6052,
+                 clip_model_name = 'convnext_large_d_320',
+                 clip_model_pretrain = 'laion2b_s29b_b131k_ft_soup',
+                 timm_kwargs = {'drop_path_rate': 0.1},
                  assigner_zero_layer_cfg=dict(
                     type='mmdet.HungarianAssigner',
                     match_costs=[
@@ -66,6 +70,8 @@ class PFC(nn.Module):
         self.num_queries = cfgs['model']['num_queries']
         self.use_pa_seg = use_pa_seg
         self.use_sem_loss = use_sem_loss
+        self.label_map = None
+        self.label_inverse_map = None
         self.thing_class = None
         self.stuff_class = None
         self.thing_map = None
@@ -74,7 +80,7 @@ class PFC(nn.Module):
         self.base_class = None
         self.total_map = None
         self.total_inverse_map = None
-        self.total_class = list(range(self.nclasses-1))
+        self.total_class = None
         self.categroy_overlapping_mask = None
         self.map_stuff_class = None
         self.map_thing_class = None
@@ -85,8 +91,16 @@ class PFC(nn.Module):
         self.loss_mask = MODELS.build(cfgs['model']['loss_mask'])
         self.loss_dice = MODELS.build(cfgs['model']['loss_dice'])
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
+        open_visual = open_clip.create_model_and_transforms(clip_model_name, pretrained=clip_model_pretrain)[0].visual
+        self.trunk_head = open_visual.trunk.head
+        self.head = open_visual.head
+        del open_visual
+        freeze_everything(self.head)
+        freeze_everything(self.trunk_head)
         for i in range(self.deconv_layers):
-            if i==0:
+            if i==0 and i==self.deconv_layers-1:
+                self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.fcclip_vision_dim,self.fcclip_vision_dim,kernel_size=7,stride=1, padding=3, bias=False))
+            elif i==0:
                 self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.fcclip_vision_dim,self.deconv_hidden_dim,kernel_size=7,stride=1, padding=3, bias=False))
             elif i==self.deconv_layers-1:
                 self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.deconv_hidden_dim,self.fcclip_vision_dim, kernel_size=3, stride=1, padding=1, bias=False)) 
@@ -97,6 +111,7 @@ class PFC(nn.Module):
             self.deconv.add_module(f'up_{i}', nn.UpsamplingNearest2d(scale_factor=2) if i != self.deconv_layers - 1 else nn.UpsamplingBilinear2d(scale_factor=2))
         self.queries = SubMConv3d(self.query_embed_dims, self.num_queries, indice_key="logit", 
                                     kernel_size=1, stride=1, padding=0, bias=False)
+        xavier_init(self.queries)
         if self.use_sem_loss:
             self.loss_ce = MODELS.build(dict(
                             type='mmdet.CrossEntropyLoss',
@@ -105,15 +120,24 @@ class PFC(nn.Module):
                             loss_weight=1.0))
             self.loss_lovasz = MODELS.build(dict(type='LovaszLoss',
                                                 reduction='none',))
-            self.sem_queries = nn.Conv3d(self.query_embed_dims, self.fcclip_text_dim, kernel_size=1, stride=1, padding=0, bias=False)
+            self.sem_queries = nn.Conv3d(self.query_embed_dims, self.nclasses, kernel_size=1, stride=1, padding=0, bias=False)
+            xavier_init(self.sem_queries)
         self.pre_norm = nn.BatchNorm1d(self.fcclip_vision_dim)
         self.void_embedding = nn.Embedding(1,self.fcclip_text_dim)
         xavier_init(self.void_embedding)
+        self.query_embed = nn.Embedding(self.num_queries,self.num_queries)
         self.vfe_scatter = DynamicScatter(self.voxel_size,
                                     self.point_cloud_range,
                                     ( cfgs['model']['scatter_points_mode']!= 'max'))
 
-        self.pe_vision_proj = nn.Linear(self.fcclip_vision_dim,self.query_embed_dims)
+        # self.pe_vision_proj = nn.Linear(self.fcclip_vision_dim,self.query_embed_dims)
+        self.decoder_norm = nn.LayerNorm(self.query_embed_dims)
+        self.mask_embed = MLP((self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
+        self.mask_proj = MLP((self.nclasses,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
+        self.pe_vision_proj = MLP((self.fcclip_vision_dim,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
+        self.mask_features = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=1, stride=1, padding=0)
+        self.mask_pooling = MaskPooling()
+        self._mask_pooling_proj = MLP((self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.fcclip_text_dim))
         if self.pe_type == 'polar' or self.pe_type == 'cart':
             self.position_proj = nn.Linear(pos_dim, self.query_embed_dims)
             self.position_norm = build_norm_layer(dict(type='LN'),
@@ -292,10 +316,15 @@ class PFC(nn.Module):
         sem_preds = []
         if self.use_sem_loss:
             sem_queries = self.sem_queries.weight.clone().squeeze(-1).squeeze(-1).repeat(1,1,batch_size).permute(2,0,1) # [20,256,1,1,1] -> [1,20,256]
+            sem_queries = self.decoder_norm(sem_queries)
+            sem_queries = self.mask_embed(sem_queries) # [1, 17, 256]
+            outputs_mask = self.mask_proj(sem_queries.transpose(1,2)).transpose(1,2).unsqueeze(3) # [1,256,768]  
+
             for b in range(len(pe_features)):
-                # 修改成和text_features余弦相似度
-                sem_pred = torch.einsum("nc,vc->vn", sem_queries[b], pe_features[b]) # [n,c]*[v,c] -> [v,n] [37660,20]
-                # sem_pred = get_classification_logits(sem_pred,text_features,self.logit_scale)[...,:-1]
+                maskpool_embeddings = self.mask_pooling(x=pe_features[b].unsqueeze(0).unsqueeze(3),mask=outputs_mask)
+                maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings.transpose(1,2)).squeeze(0)
+                sem_pred = get_classification_logits(maskpool_embeddings,text_features,self.logit_scale)[...,:-1]
+                # sem_pred = F.normalize(sem_pred, p=2, dim=-1)
                 sem_preds.append(sem_pred)
                 stuff_queries = sem_queries[b][self.stuff_class] # [5,256]
                 queries[b] = torch.cat([queries[b], stuff_queries], dim=0) # [133,256]
@@ -312,14 +341,17 @@ class PFC(nn.Module):
     def pa_seg_single(self, queries, features, mpe, layer):
         """Get Predictions of a single sample level."""
         mask_queries = queries # [133,256]
-        mask_queries = self.fc_mask[layer](mask_queries) # [139,256]
-        mask_pred = torch.einsum('nc,vc->nv', mask_queries, features)  # [139, 37660]
+        mask_queries = self.fc_mask[layer](mask_queries) # [133,256]
+        mask_pred = torch.einsum('nc,vc->nv', mask_queries, features)  # [133, 37660]
 
         if self.use_pa_seg:
             pos_mask_queries = queries
             pos_mask_queries = self.fc_coor_mask[layer](pos_mask_queries)
             pos_mask_pred = torch.einsum('nc,vc->nv', pos_mask_queries, mpe) # [139,37660]
             mask_pred = mask_pred + pos_mask_pred
+            
+            # 考虑添加sem_queries
+            # sem_queries = queries
         else:
             pos_mask_pred = None
 
@@ -335,7 +367,7 @@ class PFC(nn.Module):
         class_preds_buffer = []
         mask_preds_buffer = []
         pos_mask_preds_buffer = []
-        features = self.pe_vision_proj(features)
+        sem_preds_buffer = []
         batch_size = voxel_coors[:, 0].max().item() + 1
         feature_split = []
         voxel_coor_split = []
@@ -349,7 +381,7 @@ class PFC(nn.Module):
         mask_preds_buffer.append(mask_preds)
         pos_mask_preds_buffer.append(pos_mask_preds)
         for i in range(self.num_decoder_layers):
-            queries = self.transformer_decoder[i](queries, features, mask_preds) # queries [139,256] features [37510, 256] mask_preds [139, 37510]
+            queries = self.transformer_decoder[i](queries, features, mask_preds) # queries [133,256] features [37510, 256] mask_preds [139, 37510]
             class_preds, mask_preds, pos_mask_preds = self.pa_seg(queries, features, mpe, layer=i+1)
             class_preds_buffer.append(class_preds)
             mask_preds_buffer.append(mask_preds)
@@ -404,10 +436,10 @@ class PFC(nn.Module):
         num_samples = num_pos + num_neg
         num_points = positive_gt_masks.shape[-1]
         labels = positive_gt_masks.new_full((num_samples, ),
-                                            len(self.thing_map),
+                                            len(self.total_class),
                                             dtype=torch.long)
         label_weights = positive_gt_masks.new_zeros(num_samples,
-                                                    len(self.thing_map))
+                                                    len(self.total_class))
         mask_targets = positive_gt_masks.new_zeros(num_samples, num_points)
         mask_weights = positive_gt_masks.new_zeros(num_samples, num_points)
 
@@ -425,7 +457,7 @@ class PFC(nn.Module):
 
         if gt_sem_masks is not None and gt_sem_classes is not None:
             sem_labels = positive_gt_masks.new_full((len(self.stuff_class), ),
-                                                    len(self.thing_map),
+                                                    len(self.total_class),
                                                     dtype=torch.long)
             sem_targets = positive_gt_masks.new_zeros(len(self.stuff_class),
                                                       num_points)
@@ -433,19 +465,18 @@ class PFC(nn.Module):
                                                       num_points)
             sem_stuff_weights = torch.eye(
                 len(self.stuff_class), device=positive_gt_masks.device)
-            sem_label_weights = label_weights.new_zeros(len(self.stuff_class), len(self.thing_map)).float()
-            stuff_class_map = torch.stack(list(map(lambda x: torch.tensor(self.thing_inverse_map[x.item()],device=positive_gt_masks.device), torch.tensor(self.stuff_class,device=positive_gt_masks.device))))
-            sem_label_weights[:, stuff_class_map] = sem_stuff_weights
+            sem_label_weights = label_weights.new_zeros(len(self.stuff_class), len(self.total_class)).float()
+            sem_label_weights[:, self.stuff_class] = sem_stuff_weights
 
             if len(gt_sem_classes > 0):
-                sem_inds = gt_sem_classes - stuff_class_map[0]
+                sem_inds = gt_sem_classes - self.stuff_class[0]
                 sem_inds = sem_inds.long()
                 sem_labels[sem_inds] = gt_sem_classes.long()
                 sem_targets[sem_inds] = gt_sem_masks
                 sem_weights[sem_inds] = 1
 
-            label_weights[:, stuff_class_map[0]] = 0
-            label_weights[:, len(self.thing_map)-1] = 0
+            label_weights[:, self.stuff_class] = 0
+            label_weights[:, len(self.total_class)-1] = 0
             labels = torch.cat([labels, sem_labels])
             label_weights = torch.cat([label_weights, sem_label_weights])
             mask_targets = torch.cat([mask_targets, sem_targets])
@@ -519,13 +550,9 @@ class PFC(nn.Module):
             # update 
             is_thing_class = (torch.isin(gt_classes[b],torch.tensor(self.thing_class,device=gt_classes[b].device))) & (gt_classes[b]!=self.ignore_index)
             is_stuff_class = (torch.isin(gt_classes[b],torch.tensor(self.stuff_class,device=gt_classes[b].device))) & (gt_classes[b]!=self.ignore_index)
-            gt_thing = gt_classes[b][is_thing_class]      
-            gt_thing = torch.stack(list(map(lambda x: torch.tensor(self.thing_inverse_map[x.item()],device=gt_thing.device), gt_thing)))
-            gt_stuff = gt_classes[b][is_stuff_class]
-            gt_stuff = torch.stack(list(map(lambda x: torch.tensor(self.thing_inverse_map[x.item()],device=gt_stuff.device), gt_stuff)))
-            gt_thing_classes.append(gt_thing)
+            gt_thing_classes.append(gt_classes[b][is_thing_class])
             gt_thing_masks.append(gt_masks[b][is_thing_class])
-            gt_stuff_classes.append(gt_stuff)
+            gt_stuff_classes.append(gt_classes[b][is_stuff_class])
             gt_stuff_masks.append(gt_masks[b][is_stuff_class])
 
         sampling_results = []
@@ -565,6 +592,7 @@ class PFC(nn.Module):
                     thing_class_pred_detach = class_preds[layer+1][b][:self.num_queries,:].detach()
                 # cos
                 thing_class_pred_detach = get_classification_logits(thing_class_pred_detach,text_features,self.logit_scale)
+                # thing_class_pred_detach = F.normalize(thing_class_pred_detach, p=2, dim=-1)
                 thing_class_pred_detach = thing_class_pred_detach[...,:-1]
                 thing_masks_pred_detach = thing_masks_pred_detach = mask_preds[layer][b][:self.num_queries,:].detach()
                 # 取可见的部分
@@ -608,17 +636,16 @@ class PFC(nn.Module):
         semantic_preds = []
         instance_ids = []
         for i in range(len(class_preds)):
-            class_pred = class_preds[i]
+            class_pred = class_preds[i] 
             mask_pred = mask_preds[i]
 
-            scores = class_pred[:self.num_queries][:, self.map_thing_class] # 139 = 128+num_class
+            scores = class_pred[:self.num_queries][:, self.thing_class] # 139 = 128+num_class
             thing_scores, thing_labels = scores.sigmoid().max(dim=1)
             thing_scores *= 2
             thing_labels += self.thing_class[0]
             # 修改stuff_class对应到base里的和novel里的
-            stuff_scores = class_pred[
-                self.num_queries:][:, self.map_stuff_class].diag().sigmoid()
-            stuff_labels = torch.tensor(self.map_stuff_class)
+            stuff_scores = class_pred[self.num_queries:][:, self.stuff_class].diag().sigmoid()
+            stuff_labels = torch.tensor(self.stuff_class)
             stuff_labels = stuff_labels.to(thing_labels.device)
 
 
@@ -638,12 +665,13 @@ class PFC(nn.Module):
                                                0)
 
             if cur_masks.shape[0] == 0:
+                # semantic_pred = torch.stack(list(map(lambda x: torch.tensor(self.total_inverse_map[x.item()] if x!=self.ignore_index else x,device=semantic_pred.device), semantic_pred)))
                 semantic_preds.append(semantic_pred)
                 instance_ids.append(instance_id)
                 continue
 
             cur_prob_masks = cur_masks * cur_scores.reshape(-1, 1)
-            cur_mask_ids = cur_prob_masks.argmax(0)
+            cur_mask_ids = cur_prob_masks.argmax(0) # cur_mask_ids全0学不到东西
             id = 1
 
             for k in range(cur_classes.shape[0]):
@@ -660,31 +688,46 @@ class PFC(nn.Module):
                         instance_id[mask] = id
                         id += 1
             # map到CB+CN
-            semantic_pred = torch.stack(list(map(lambda x: torch.tensor(self.total_inverse_map[x.item()] if x!=self.ignore_index else x,device=semantic_pred.device), semantic_pred)))
+            # semantic_pred = torch.stack(list(map(lambda x: torch.tensor(self.total_inverse_map[x.item()] if x!=self.ignore_index else x,device=semantic_pred.device), semantic_pred)))
             semantic_preds.append(semantic_pred)
             instance_ids.append(instance_id)
         return (semantic_preds, instance_ids)
 
-    def loss_single_layer(self, class_preds, mask_preds, pos_mask_preds, class_targets, mask_targets, label_weights, layer, train_dict,text_features,reduction_override=None):
+    def loss_single_layer(self, class_preds, mask_preds, pos_mask_preds, class_targets, mask_targets, label_weights, layer, train_dict,text_features,sem_preds,reduction_override=None):
         batch_size = len(mask_preds)
         losses = dict()
 
         class_targets = torch.cat(class_targets, 0)
-        pos_inds = (class_targets != len(self.thing_map)) & (
-            class_targets < len(self.thing_map))
+        pos_inds = (class_targets != len(self.total_class)) & (
+            class_targets < len(self.total_class))
         bool_pos_inds = pos_inds.type(torch.bool)
         bool_pos_inds_split = bool_pos_inds.reshape(batch_size, -1)
 
         if class_preds is not None:
-            class_preds = [get_classification_logits(preds,text_features,self.logit_scale)[...,:-1] for preds in class_preds]
+            # alpha = self.geometric_ensemble_alpha
+            # beta = self.geometric_ensemble_beta
+            # category_overlapping_mask = self.categroy_overlapping_mask.to(class_preds[0].device)
+            class_preds = [get_classification_logits(preds,text_features,self.logit_scale)[...,:-1].softmax(-1) for preds in class_preds]
+            
+            # cls_results_buffer = []
+            # for b in range(batch_size):
+            #     in_vocubulary_class_preds = class_preds[b]
+            #     out_cls = torch.einsum('nv,vc->nc',mask_preds[b],sem_preds[b])
+            #     out_vocabulary_class_preds = get_classification_logits(out_cls,text_features,self.logit_scale)[...,:-1]
+            #     in_vocubulary_class_preds = in_vocubulary_class_preds.softmax(-1)
+            #     out_vocabulary_class_preds = out_vocabulary_class_preds.softmax(-1)
+            #     cls_logits_seen = ((in_vocubulary_class_preds ** (1 - alpha) * out_vocabulary_class_preds**alpha).log()* category_overlapping_mask)
+            #     cls_logits_unseen = ((in_vocubulary_class_preds ** (1 - beta) * out_vocabulary_class_preds**beta).log()* category_overlapping_mask)
+            #     cls_results_buffer.append(cls_logits_seen + cls_logits_unseen)
+            # class_preds = torch.cat(cls_results_buffer, 0)  # [B*N]
             class_preds = torch.cat(class_preds, 0)  # [B*N]
             label_weights = torch.cat(label_weights, 0)  # [B*N]
             num_pos = pos_inds.sum().float()
             avg_factor = reduce_mean(num_pos)
 
             losses[f'loss_cls_{layer}'] = self.loss_cls(
-                class_preds,
-                class_targets,
+                class_preds, # [133, 12]
+                class_targets, # [133]
                 label_weights,
                 avg_factor=avg_factor,
                 reduction_override=reduction_override)
@@ -754,22 +797,30 @@ class PFC(nn.Module):
 
         return losses
 
+    def transform_pooled_clip_feature(self,x):
+        batch, num_query, channel = x.shape # [1, 250, 1536]
+        x = x.reshape(batch*num_query, channel, 1, 1) # fake 2D input
+        x = self.trunk_head(x)
+        x = self.head(x)
+        return x
+
     def forward(self, train_dict):
         fcclip_voxel_features, voxel_coors = self.extract_clip_features(train_dict)
-        text_features = train_dict['text_features'][0]
+        text_features = train_dict['text_features'][0] # [13, 768]
+        voxel_features = self.pe_vision_proj(fcclip_voxel_features) # [V，256]
+        masked_voxel_features = self.mask_features(voxel_features.unsqueeze(1)).squeeze(1)
         # add void class weight
         text_features = torch.cat([text_features,F.normalize(self.void_embedding.weight,dim=-1)],dim=0)
-        class_preds_buffer, mask_preds_buffer, pos_mask_preds_buffer, sem_preds = self.forward_vision_features(fcclip_voxel_features,voxel_coors,text_features)
+        class_preds_buffer, mask_preds_buffer, pos_mask_preds_buffer, sem_preds = self.forward_vision_features(masked_voxel_features,voxel_coors,text_features)
         if self.training:
             cls_targets_buffer, mask_targets_buffer, label_weights_buffer = self.bipartite_matching(class_preds_buffer, mask_preds_buffer, pos_mask_preds_buffer, train_dict,text_features)
             losses = dict()
             for i in range(self.num_decoder_layers+1):
                 losses.update(self.loss_single_layer(class_preds_buffer[i], mask_preds_buffer[i], pos_mask_preds_buffer[i],
-                                                    cls_targets_buffer[i], mask_targets_buffer[i], label_weights_buffer[i], i,train_dict,text_features))
+                                                    cls_targets_buffer[i], mask_targets_buffer[i], label_weights_buffer[i], i,train_dict,text_features,sem_preds))
             if self.use_sem_loss:
                 seg_label = train_dict['voxel_semantic_labels']# [46838]
                 for b in range(len(sem_preds)):
-                    seg_label[b] = torch.stack(list(map(lambda x: torch.tensor(self.thing_inverse_map[x.item()], device=seg_label[0].device) if x != self.ignore_index else x, seg_label[b])))
                     voxel2point_map = train_dict['voxel2point_map'][b]
                     seenmask = train_dict['seenmask'][b]
                     seen_unique_indices = train_dict['seen_unique_indices'][b]
@@ -791,29 +842,26 @@ class PFC(nn.Module):
             class_results_buffer = []
             fcclip_feature_split = []
             voxel_coor_split = []
-            fcclip_voxel_features = self.pe_vision_proj(fcclip_voxel_features)
             for i in range(batch_size):
                 fcclip_feature_split.append(fcclip_voxel_features[voxel_coors[:, 0] == i])
                 voxel_coor_split.append(voxel_coors[voxel_coors[:, 0] == i])
-            _,_,_, sem_preds = self.init_inputs(fcclip_feature_split, voxel_coor_split, batch_size,text_features)
             for b in range(batch_size):
+                clip_feature = fcclip_feature_split[b].transpose(0,1).unsqueeze(0).unsqueeze(3) # [V, 1536]
                 mask_cls = mask_cls_results[b] #  [134,768] [embed_dim+len(self.stuff_class),text_features]
-                mask_pred = mask_pred_results[b] # [134,12826]
-                mask_cls = get_classification_logits(mask_cls, text_features, self.logit_scale) # [133, 12]
-                # is_void_prob = F.softmax(mask_cls_results, dim=-1)[..., -1:]
-                sem_pred = sem_preds[b]
-                in_vocubulary_class_preds = mask_cls[...,:-1]
-                out_cls = torch.einsum('nv,vc->nc',mask_pred,sem_pred) # [133,768]
-                out_vocabulary_class_preds = get_classification_logits(out_cls,text_features,self.logit_scale)[...,:-1] # [133,12]
+                mask_for_pooling = mask_pred_results[b].unsqueeze(0).unsqueeze(3)  # [134,12826]
+                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling)
+                pooled_clip_feature = self.transform_pooled_clip_feature(pooled_clip_feature)
+                in_vocabulary_class_preds = get_classification_logits(mask_cls, text_features, self.logit_scale)[...,:-1] # [134, 17]
+                out_vocabulary_class_preds = get_classification_logits(pooled_clip_feature,text_features,self.logit_scale)[...,:-1]
                 # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-                in_vocubulary_class_preds = in_vocubulary_class_preds.softmax(-1)
+                in_vocabulary_class_preds = in_vocabulary_class_preds.softmax(-1)
                 out_vocabulary_class_preds = out_vocabulary_class_preds.softmax(-1)
                 cls_logits_seen = (
-                    (in_vocubulary_class_preds ** (1 - alpha) * out_vocabulary_class_preds**alpha).log()
+                    (in_vocabulary_class_preds ** (1 - alpha) * out_vocabulary_class_preds**alpha)
                     * category_overlapping_mask
                 )
                 cls_logits_unseen = (
-                    (in_vocubulary_class_preds ** (1 - beta) * out_vocabulary_class_preds**beta).log()
+                    (in_vocabulary_class_preds ** (1 - beta) * out_vocabulary_class_preds**beta)
                     * (~ category_overlapping_mask)
                 ) 
                 cls_results = cls_logits_seen + cls_logits_unseen
@@ -822,6 +870,8 @@ class PFC(nn.Module):
             semantic_preds, instance_ids = self.generate_panoptic_results(class_results_buffer, mask_pred_results)
             semantic_preds = torch.cat(semantic_preds)
             instance_ids = torch.cat(instance_ids)
+            print(torch.unique(semantic_preds))
+            print(torch.unique(instance_ids))
             pts_semantic_preds = []
             pts_instance_preds = []
             for batch_idx in range(batch_size):
@@ -840,7 +890,7 @@ class PFC(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels,act_type='GELU',bias=False):
         super().__init__()
         self.mlp = nn.ModuleList()
         for cc in range(len(channels) - 2):
@@ -849,11 +899,11 @@ class MLP(nn.Module):
                     nn.Linear(
                         channels[cc],
                         channels[cc + 1],
-                        bias=False),
+                        bias=bias),
                     build_norm_layer(
                         dict(type='LN'), channels[cc + 1])[1],
                     build_activation_layer(
-                        dict(type='GELU'))))
+                        dict(type=act_type))))
         self.mlp.append(
             nn.Linear(channels[-2], channels[-1]))
         

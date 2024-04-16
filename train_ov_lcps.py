@@ -15,14 +15,14 @@ import shutil
 from tqdm import tqdm
 from nuscenes import NuScenes
 from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR, CosineAnnealingWarmRestarts
-
+from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.AppLogger import AppLogger
 from network.PFC import PFC
 from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset
 from dataloader.eval_sampler import SequentialDistributedSampler
 from network.util.instance_post_processing import get_panoptic_segmentation
 from network.util.loss import PanopticLoss, PixelLoss
-from utils.eval_pq import PanopticEval
+from utils.eval_pq import PanopticEval,OV_PanopticEval
 from utils.metric_util import per_class_iu, fast_hist_crop
 
 warnings.filterwarnings("ignore")
@@ -44,6 +44,11 @@ def inverse_transform(learning_map):
 def SemKITTI2train_single(label):
     return label - 1  # uint8 trick, transform null area 0->255
 
+def get_model(model):
+    if isinstance(model, DDP):
+        return model.module
+    else:
+        return model
 
 def load_pretrained_model(model, pretrained_model):
     model_dict = model.state_dict()
@@ -204,13 +209,19 @@ def main():
         learning_map = nuscenesyaml['learning_map']
 
     # training
-    epoch = 1
+    epoch = 0
     best_val_PQ = 0
     start_training = False
-    my_model.train()
+    # my_model.train()
     global_iter = 0
-    evaluator = PanopticEval(len(unique_label) + 1 + 1, None, [0, len(unique_label) + 1], min_points=min_points)
-
+    evaluator = OV_PanopticEval(len(unique_label)+1+1, None, [0,len(unique_label)+1], min_points=min_points,offset=65536)
+    loss_fn_dict ={
+        'sem_loss':[],
+        'class_loss':[],
+        'mask_loss':[],
+        'dice_loss':[],
+        'dice_pos_loss':[]
+    }
     last_avg_loss = 0.0
     while epoch < cfgs['model']['max_epoch']:
         avg_loss = 0.0
@@ -236,21 +247,12 @@ def main():
 
             if args.local_rank != -1:
                 torch.distributed.barrier()
-            my_model.thing_class = SemKITTI2train(val_pt_dataset.thing_list)
-            my_model.stuff_class = SemKITTI2train(val_pt_dataset.stuff_list)
-            my_model.novel_class = SemKITTI2train(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list)
-            my_model.base_class = SemKITTI2train(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list)
-            my_model.thing_map = transform_map(SemKITTI2train(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list))
-            my_model.thing_inverse_map = inverse_transform(my_model.thing_map)
-            my_model.novel_class = SemKITTI2train(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list)
-            my_model.total_map = my_model.thing_map
-            base_num = len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list)
-            for i,c in enumerate(my_model.novel_class):
-                my_model.total_map[base_num+i] = c 
-            my_model.total_inverse_map = inverse_transform(my_model.total_map)   
-            my_model.categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(len(my_model.base_class), True, dtype=bool),np.full(len(my_model.novel_class),False,dtype=bool))))
-            my_model.map_stuff_class = list(np.vectorize(my_model.total_inverse_map.__getitem__)(my_model.stuff_class))
-            my_model.map_thing_class = list(np.vectorize(my_model.total_inverse_map.__getitem__)(my_model.thing_class))
+            get_model(my_model).label_map = transform_map(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list,val_pt_dataset.novel_thing_list,val_pt_dataset.novel_stuff_list,17])))
+            get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
+            get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.thing_list)))
+            get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.stuff_list)))
+            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list,17]))))
+            get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool),np.full(1,True,dtype=bool))))
             with torch.no_grad():
                 for i_iter_val, val_dict in enumerate(val_dataset_loader):
                     val_dict['voxel2point_map'] = [torch.from_numpy(i) for i in val_dict['voxel2point_map']]
@@ -266,6 +268,7 @@ def main():
                         val_dict['text_features'] = torch.from_numpy(val_dict['text_features']).cuda()
 
                     predict_labels_sem, pts_instance_preds = my_model(val_dict)
+                    predict_labels_sem = np.vectorize(get_model(my_model).label_map.__getitem__)(predict_labels_sem)
                     predict_labels_sem = [sem + 1 for sem in predict_labels_sem]
                     val_grid = val_dict['pol_voxel_ind']
                     val_pt_labels = val_dict['pt_sem_label']
@@ -273,14 +276,14 @@ def main():
                     for count, i_val_grid in enumerate(val_grid):
                         panoptic = pts_instance_preds[count]
                         # 语义分割预测出是前景类别，但是全景分割预测它是背景(全景ID预测为0)，当作noise处理
-                        if datasetname == 'SemanticKitti':
-                            panoptic_mask1 = (panoptic <= 8) & (panoptic > 0)
-                            panoptic[panoptic_mask1] = 0
-                        elif datasetname == 'nuscenes':
-                            panoptic_mask1 = (panoptic <= 10) & (panoptic > 0)
-                            panoptic[panoptic_mask1] = 0
-                        else:
-                            raise NotImplementedError
+                        # if datasetname == 'SemanticKitti':
+                        #     panoptic_mask1 = (panoptic <= 8) & (panoptic > 0)
+                        #     panoptic[panoptic_mask1] = 0
+                        # elif datasetname == 'nuscenes':
+                        #     panoptic_mask1 = (panoptic <= 10) & (panoptic > 0)
+                        #     panoptic[panoptic_mask1] = 0
+                        # else:
+                        #     raise NotImplementedError
 
                         if args.local_rank < 1:
                             # 用实例标签的语义
@@ -288,13 +291,14 @@ def main():
                                 sem_gt = np.squeeze(val_pt_labels[count])
                                 inst_gt = np.squeeze(val_pt_inst[count])      
                             elif datasetname == 'nuscenes':
-                                sem_gt = np.squeeze(val_pt_inst[count]) // 1000
-                                sem_gt = np.vectorize(learning_map.__getitem__)(sem_gt)
+                                # sem_gt = np.squeeze(val_pt_inst[count]) // 1000
+                                # sem_gt = np.vectorize(learning_map.__getitem__)(sem_gt)
+                                sem_gt = np.squeeze(val_pt_labels[count])
                                 inst_gt = np.squeeze(val_pt_inst[count])
                             else:
                                 raise NotImplementedError
 
-                            evaluator.addBatch(panoptic & 0xFFFF, panoptic, 
+                            evaluator.addBatch(predict_labels_sem[count], panoptic, 
                                                 sem_gt, inst_gt)
                             # PQ, SQ, RQ, class_all_PQ, class_all_SQ, class_all_RQ = evaluator.getPQ() # for debug
                             sem_hist_list.append(fast_hist_crop(
@@ -302,7 +306,7 @@ def main():
                                 val_pt_labels[count],
                                 unique_label))
                         else:
-                            save_dict['item1'].append(panoptic & 0xFFFF)
+                            save_dict['item1'].append(predict_labels_sem[count])
                             save_dict['item2'].append(panoptic)
                             save_dict['item3'].append(val_pt_labels[count])
                             save_dict['item4'].append(val_pt_inst[count])
@@ -344,8 +348,9 @@ def main():
                                     sem_gt = np.squeeze(cur_dict['item3'][j])
                                     inst_gt = np.squeeze(cur_dict['item4'][j])
                                 elif datasetname == 'nuscenes':
-                                    sem_gt = np.squeeze(cur_dict['item4'][j] // 1000)
-                                    sem_gt = np.vectorize(learning_map.__getitem__)(sem_gt)
+                                    # sem_gt = np.squeeze(cur_dict['item4'][j] // 1000)
+                                    # sem_gt = np.vectorize(learning_map.__getitem__)(sem_gt)
+                                    sem_gt = np.squeeze(cur_dict['item3'][j])
                                     inst_gt = np.squeeze(cur_dict['item4'][j])
                                 else:
                                     raise NotImplementedError
@@ -402,12 +407,11 @@ def main():
                     # get loss and mIoU result
                     ######################################################################################################
                     if start_training:
-                        sem_l, hm_l, os_l, im_l, pix_l = np.nanmean(loss_fn.loss_dict['semantic_loss']), np.nanmean(
-                            loss_fn.loss_dict['heatmap_loss']), np.nanmean(loss_fn.loss_dict['offset_loss']), np.nanmean(
-                            loss_fn.loss_dict['instmap_loss']), np.nanmean(pix_loss_fn.loss_dict['pix_loss'])
+                        sem_l, class_l, dice_l, dice_pos_l = np.nanmean(loss_fn_dict['sem_loss']),np.nanmean(loss_fn_dict['class_loss']),\
+                                np.nanmean(loss_fn_dict['dice_loss']), np.nanmean(loss_fn_dict['dice_pos_loss'])
                         logger.info(
-                            'epoch %d iter %5d, avg_loss: %.1f, semantic loss: %.1f, center loss: %.1f, offset loss: %.1f, instmap loss: %.1f, pix loss: %.1f\n' %
-                            (epoch, i_iter, last_avg_loss, sem_l, hm_l, os_l, im_l, pix_l))
+                            'epoch %d iter %5d, avg_loss: %.1f, semantic loss: %.1f, class loss: %.1f, dice loss: %.1f, dice position loss: %.1f\n' %
+                            (epoch, i_iter, last_avg_loss, sem_l, class_l, dice_l, dice_pos_l))
 
                     iou = per_class_iu(sum(sem_hist_list))
                     logger.info('Validation per class iou: ')
@@ -428,13 +432,12 @@ def main():
             print(f"Epoch {epoch} => Start Training...")
         if args.local_rank != -1:
             train_sampler.set_epoch(epoch)
-        my_model.thing_class = SemKITTI2train(train_pt_dataset.thing_list)
-        my_model.stuff_class = SemKITTI2train(train_pt_dataset.stuff_list)
-        my_model.novel_class = SemKITTI2train(train_pt_dataset.novel_thing_list+train_pt_dataset.novel_stuff_list)
-        my_model.thing_map = transform_map(my_model.thing_class+my_model.stuff_class)
-        my_model.thing_inverse_map = inverse_transform(my_model.thing_map)
-        my_model.base_class = SemKITTI2train(train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list)
-        my_model.categroy_overlapping_mask = torch.from_numpy(np.isin(my_model.total_class,my_model.base_class))
+        get_model(my_model).label_map = transform_map(SemKITTI2train(np.hstack([train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list,train_pt_dataset.novel_thing_list,train_pt_dataset.novel_stuff_list,17])))
+        get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
+        get_model(my_model).thing_class = np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(train_pt_dataset.thing_list))
+        get_model(my_model).stuff_class = np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(train_pt_dataset.stuff_list))
+        get_model(my_model).total_class = np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list,17])))
+        get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
         # for i,c in enumerate(my_model.novel_class):
         #     my_model.total_map[i+len()]
         pbar = tqdm(total=len(train_dataset_loader))
@@ -449,7 +452,7 @@ def main():
             train_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in train_dict['pol_voxel_ind']]
             # train_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
             #                             train_dict['return_fea']]
-            train_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
+            train_dict['voxel_semantic_labels'] = [torch.from_numpy(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(i))).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
             train_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in train_dict['voxel_instance_labels']]
             if pix_fusion:
                 # train_dict['camera_channel'] = torch.from_numpy(train_dict['camera_channel']).float().cuda()
@@ -462,7 +465,6 @@ def main():
                 # train_dict['masks'] = [torch.from_numpy(i).cuda() for i in train_dict['masks']]
                 # train_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['valid_mask']]
                 # train_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in train_dict['im_label']], dim=0)).cuda()
-
             loss_dict = my_model(train_dict)
             loss = torch.sum(torch.stack(list(loss_dict.values())),dim=0)
             sem_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k=='loss_ce'or k=='loss_lovasz'])          
@@ -484,7 +486,10 @@ def main():
             else:
                 optimizer.step()
                 optimizer.zero_grad()
-            
+            loss_fn_dict['sem_loss'].append(sem_loss)
+            loss_fn_dict['class_loss'].append(cls_loss)
+            loss_fn_dict['dice_loss'].append(dice_loss)
+            loss_fn_dict['dice_pos_loss'].append(dice_pos_loss)
             pbar.set_postfix({"sem_loss": sem_loss, 
                             "class_loss": cls_loss,
                             "mask_loss": mask_loss,
@@ -495,6 +500,7 @@ def main():
             start_training = True
             global_iter += 1
             del train_dict
+        sem_l, class_l, dice_l, dice_pos_l = sem_loss,cls_loss,mask_loss,dice_loss,
         pbar.close()
         scheduler_steplr.step()
         epoch += 1

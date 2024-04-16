@@ -55,21 +55,32 @@ import torch.nn as nn
 
 # print(res_voxel_coors)
 
-point_fcclip_features = torch.rand(6, 34720, 1536) 
-pol_voxel_ind = torch.randint(0, 10000, size=(34720, 3))
+# point_fcclip_features = torch.rand(6, 34720, 1536) 
+# pol_voxel_ind = torch.randint(0, 10000, size=(34720, 3))
 
-# 步骤1: 获取唯一的 voxel 索引和对应的计数
-unique_voxel_idx, inverse_idx, voxel_counts = torch.unique(pol_voxel_ind[:, 0], return_inverse=True, return_counts=True)
-num_voxels = len(unique_voxel_idx)
-print(pol_voxel_ind[:, 0])
+# # 步骤1: 获取唯一的 voxel 索引和对应的计数
+# unique_voxel_idx, inverse_idx, voxel_counts = torch.unique(pol_voxel_ind[:, 0], return_inverse=True, return_counts=True)
+# num_voxels = len(unique_voxel_idx)
+# print(pol_voxel_ind[:, 0])
 
-# 步骤2: 计算六个摄像头 point_fcclip_features 的平均值
-avg_point_fcclip_features = point_fcclip_features.mean(dim=0)
-print(avg_point_fcclip_features.shape)
+# # 步骤2: 计算六个摄像头 point_fcclip_features 的平均值
+# avg_point_fcclip_features = point_fcclip_features.mean(dim=0)
+# print(avg_point_fcclip_features.shape)
 
-# 步骤3: 创建 voxel_fcclip_features 张量并填充数据
-voxel_fcclip_features = torch.zeros(num_voxels, 1536, device=point_fcclip_features.device)
-voxel_fcclip_features.index_add_(0, inverse_idx, avg_point_fcclip_features)
-voxel_fcclip_features /= voxel_counts.unsqueeze(1)
+# # 步骤3: 创建 voxel_fcclip_features 张量并填充数据
+# voxel_fcclip_features = torch.zeros(num_voxels, 1536, device=point_fcclip_features.device)
+# voxel_fcclip_features.index_add_(0, inverse_idx, avg_point_fcclip_features)
+# voxel_fcclip_features /= voxel_counts.unsqueeze(1)
 
-print(voxel_fcclip_features.shape)
+# print(voxel_fcclip_features.shape)
+
+# gt_classes = [torch.zeros(size=[0])]
+
+# gt_masks = [torch.zeros(size=[0,7938])]
+
+
+# checkpoint = torch.load('/home/coisini/project/fc-clip/checkpoints/fcclip_cocopan.pth')
+# print(checkpoint['model'].keys())
+import open_clip
+print(open_clip.list_pretrained())
+

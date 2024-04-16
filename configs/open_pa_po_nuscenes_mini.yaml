@@ -20,7 +20,7 @@ dataset:
         inst_flip: True
         inst_add: True
     num_worker: 4
-    min_points: 15
+    min_points: 50
 model:
     pix_fusion: True
     pix_fusion_path: ./checkpoints/resnet18-5c106cde.pth
@@ -34,7 +34,7 @@ model:
     learning_rate: 0.004
     LR_MILESTONES: [100, 150,200]
     IMAGE_SIZE: [900,1600]
-    deconv_layers: 3
+    deconv_layers: 1
     pe_type: 'mpe'
     query_embed_dims: 256
     num_queries: 128

@@ -265,10 +265,10 @@ class OV_PanopticEval:
   def addBatchPanoptic(self, x_sem_row, x_inst_row, y_sem_row, y_inst_row):
     # make sure instances are not zeros (it messes with my approach)
     x_inst_row = x_inst_row + 1
-    if self.dataset_type == 'nuscenes':
-        y_inst_row = y_inst_row % self.offset + x_sem_row * self.offset
-    elif self.dataset_type == 'semantickitti':
-        y_inst_row = y_inst_row // self.offset * self.offset + x_sem_row   
+    # if self.dataset_type == 'nuscenes':
+    #     y_inst_row = y_inst_row % self.offset + x_sem_row * self.offset
+    # elif self.dataset_type == 'semantickitti':
+    #     y_inst_row = y_inst_row // self.offset * self.offset + x_sem_row   
     y_inst_row = y_inst_row + 1
 
     # only interested in points that are outside the void area (not in excluded classes)

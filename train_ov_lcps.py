@@ -149,8 +149,8 @@ def main():
                                                              find_unused_parameters=True)
 
     # NuScenes: MultiStepLR; SemanticKitti: CosineAnnealingLR, CosineAnnealingWarmRestarts
-    optimizer = optim.Adam(my_model.parameters(), lr=lr)
-    scheduler_steplr = MultiStepLR(optimizer, milestones=lr_step, gamma=lr_gamma)
+    optimizer = optim.Adam(my_model.parameters(), lr=lr,weight_decay=0.01)
+    scheduler_steplr = MultiStepLR(optimizer, milestones=lr_step, gamma=lr_gamma,)
     # scheduler_steplr = CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-8, verbose=True)
     # scheduler_steplr = CosineAnnealingWarmRestarts(optimizer, T_0=5, eta_min=1e-8, verbose=True)
 
@@ -211,10 +211,11 @@ def main():
     # training
     epoch = 0
     best_val_PQ = 0
+    best_val_MIOU = 0
     start_training = False
     # my_model.train()
     global_iter = 0
-    evaluator = OV_PanopticEval(len(unique_label)+1+1, None, [0,len(unique_label)+1], min_points=min_points,offset=65536)
+    evaluator = OV_PanopticEval(len(unique_label)+1+1, None, [0,len(unique_label)+1], min_points=min_points,offset=2**32)
     loss_fn_dict ={
         'sem_loss':[],
         'class_loss':[],
@@ -251,7 +252,7 @@ def main():
             get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
             get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.thing_list)))
             get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.stuff_list)))
-            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list,17]))))
+            get_model(my_model).c = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list,17]))))
             get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool),np.full(1,True,dtype=bool))))
             with torch.no_grad():
                 for i_iter_val, val_dict in enumerate(val_dataset_loader):
@@ -263,12 +264,12 @@ def main():
                     val_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in val_dict['voxel_semantic_labels']]
                     val_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in val_dict['voxel_instance_labels']]
                     if pix_fusion:
-                        val_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in val_dict['pixel_coordinates']]
-                        val_dict['ori_clip_vision_channel'] = torch.from_numpy(val_dict['ori_clip_vision_channel']).cuda()
+                        val_dict['clip_features'] = [torch.from_numpy(i).cuda() for i in val_dict['clip_features']]
                         val_dict['text_features'] = torch.from_numpy(val_dict['text_features']).cuda()
+                        val_dict['point_mask'] = [torch.from_numpy(i).cuda() for i in val_dict['point_mask']]
 
                     predict_labels_sem, pts_instance_preds = my_model(val_dict)
-                    predict_labels_sem = np.vectorize(get_model(my_model).label_map.__getitem__)(predict_labels_sem)
+                    predict_labels_sem = [np.vectorize(get_model(my_model).label_map.__getitem__)(sem) for sem in predict_labels_sem]
                     predict_labels_sem = [sem + 1 for sem in predict_labels_sem]
                     val_grid = val_dict['pol_voxel_ind']
                     val_pt_labels = val_dict['pt_sem_label']
@@ -370,7 +371,7 @@ def main():
                     for class_name, class_pq, class_sq, class_rq, class_iou in zip(unique_label_str, class_all_PQ[1:-1],
                                                                                 class_all_SQ[1:-1], class_all_RQ[1:-1],
                                                                                 ious[1:-1]):
-                        logger.info('%20s : %6.2f%%  %6.2f%%  %6.2f%%  %6.2f%%' % (
+                        logger.info('%20s : %6.8f%%  %6.8f%%  %6.8f%%  %6.8f%%' % (
                             class_name, class_pq * 100, class_sq * 100, class_rq * 100, class_iou * 100))
                     
                     thing_upper_idx_dict = {"nuscenes": 10, "SemanticKitti":8} # thing label index: nusc 1-9, kitti 1-8
@@ -384,7 +385,7 @@ def main():
                     SQ_st = np.nanmean(class_all_SQ[upper_idx+1: -1])
                     RQ_st = np.nanmean(class_all_RQ[upper_idx+1: -1])
                 
-                    logger_msg1 = 'PQ %.1f  PQ_dagger  %.1f  SQ %.1f  RQ %.1f  |  PQ_th %.1f  SQ_th %.1f  RQ_th %.1f  |  PQ_st %.1f  SQ_st %.1f  RQ_st %.1f  |  mIoU %.1f' %(
+                    logger_msg1 = 'PQ %.8f  PQ_dagger  %.8f  SQ %.8f  RQ %.8f  |  PQ_th %.8f  SQ_th %.8f  RQ_th %.8f  |  PQ_st %.8f  SQ_st %.8f  RQ_st %.8f  |  mIoU %.8f' %(
                         PQ * 100, PQ_dagger * 100, SQ * 100, RQ * 100,
                         PQ_th * 100, SQ_th * 100, RQ_th * 100,
                         PQ_st * 100, SQ_st * 100, RQ_st * 100,
@@ -396,10 +397,12 @@ def main():
                     if best_val_PQ < PQ:
                         best_val_PQ = PQ
                         torch.save(my_model.state_dict(), model_save_path)
+                    if best_val_MIOU< miou:
+                        best_val_MIOU = miou
                     
-                    logger_msg2 = 'Current val PQ is %.1f while the best val PQ is %.1f' %(
+                    logger_msg2 = 'Current val PQ is %.8f while the best val PQ is %.8f' %(
                             PQ * 100, best_val_PQ * 100)
-                    logger_msg3 = 'Current val miou is %.1f' % (miou * 100)
+                    logger_msg3 = 'Current val miou is %.8f while the best val miou is %.8f' % (miou * 100,best_val_MIOU*100)
                     logger.info(logger_msg2)
                     logger.info(logger_msg3)
 
@@ -416,7 +419,7 @@ def main():
                     iou = per_class_iu(sum(sem_hist_list))
                     logger.info('Validation per class iou: ')
                     for class_name, class_iou in zip(unique_label_str, iou):
-                        logger.info('%s : %.2f%%' % (class_name, class_iou * 100))
+                        logger.info('%s : %.8f%%' % (class_name, class_iou * 100))
                     val_miou = np.nanmean(iou) * 100
                     logger.info('Current val miou is %.1f' %
                                 val_miou)
@@ -447,24 +450,17 @@ def main():
             train_dict['voxel2point_map'] = [torch.from_numpy(i) for i in train_dict['voxel2point_map']]
             train_dict['point2voxel_map'] = [torch.from_numpy(i) for i in train_dict['point2voxel_map']]
             # train_dict['unique_grid_ind'] = [torch.from_numpy(i) for i in train_dict['unique_grid_ind']]
-            train_dict['seenmask'] = [torch.from_numpy(i).cuda() for i in train_dict['seenmask']]
-            train_dict['seen_unique_indices'] = [torch.from_numpy(i).cuda() for i in train_dict['seen_unique_indices']]
             train_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in train_dict['pol_voxel_ind']]
+            train_dict['grid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['grid_mask']]
             # train_dict['return_fea'] = [torch.from_numpy(i).type(torch.FloatTensor).cuda() for i in
             #                             train_dict['return_fea']]
             train_dict['voxel_semantic_labels'] = [torch.from_numpy(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(i))).type(torch.LongTensor).cuda() for i in train_dict['voxel_semantic_labels']]
             train_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in train_dict['voxel_instance_labels']]
             if pix_fusion:
                 # train_dict['camera_channel'] = torch.from_numpy(train_dict['camera_channel']).float().cuda()
-                train_dict['pixel_coordinates'] = [torch.from_numpy(i).cuda() for i in train_dict['pixel_coordinates']]
-                train_dict['ori_clip_vision_channel'] = torch.from_numpy(train_dict['ori_clip_vision_channel']).cuda()
+                train_dict['point_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['point_mask']]
+                train_dict['clip_features'] = [torch.from_numpy(i).cuda() for i in train_dict['clip_features']]
                 train_dict['text_features'] = torch.from_numpy(train_dict['text_features']).cuda()
-                # train_dict['thing_list'] = torch.from_numpy(train_dict['thing_list']).cuda()
-                # train_dict['img_indices_channel'] = [[torch.from_numpy(i).cuda() for i in split ] for split in train_dict['img_indices_channel']]
-                # train_dict['point2img_index_channel'] = [[torch.from_numpy(i) for i in split ] for split in train_dict['point2img_index_channel']]
-                # train_dict['masks'] = [torch.from_numpy(i).cuda() for i in train_dict['masks']]
-                # train_dict['valid_mask'] = [torch.from_numpy(i).cuda() for i in train_dict['valid_mask']]
-                # train_dict['im_label'] = SemKITTI2train(torch.cat([torch.from_numpy(i) for i in train_dict['im_label']], dim=0)).cuda()
             loss_dict = my_model(train_dict)
             loss = torch.sum(torch.stack(list(loss_dict.values())),dim=0)
             sem_loss = np.nanmean([loss_dict[k].detach().cpu().numpy()   for k in loss_dict.keys() if k=='loss_ce'or k=='loss_lovasz'])          

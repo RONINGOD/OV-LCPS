@@ -112,7 +112,6 @@ class PFC(nn.Module):
                             use_sigmoid=False,
                             class_weight=None,
                             loss_weight=1.0))
-            # self.loss_ce = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
             self.loss_lovasz = MODELS.build(dict(type='LovaszLoss',
                                                 reduction='none',))
         self.sem_queries = nn.Conv3d(self.query_embed_dims, self.nclasses, kernel_size=1, stride=1, padding=0, bias=False)
@@ -172,16 +171,16 @@ class PFC(nn.Module):
         self.fc_cls = nn.ModuleList()
         self.fc_cls.append(None)
         self.fc_mask = nn.ModuleList()
-        self.fc_mask.append(MLP(mask_channels))
+        self.fc_mask.append(MLP(mask_channels,bias=True))
         if self.use_pa_seg:
             self.fc_coor_mask = nn.ModuleList()
-            self.fc_coor_mask.append(MLP(mask_channels))
+            self.fc_coor_mask.append(MLP(mask_channels,bias=True))
             self.pa_seg_weight = pa_seg_weight    
         for _ in range(num_decoder_layers):
-            self.fc_cls.append(MLP(cls_channels))
+            self.fc_cls.append(MLP(cls_channels,bias=True))
             self.fc_mask.append(MLP(mask_channels))
             if use_pa_seg:
-                self.fc_coor_mask.append(MLP(mask_channels))
+                self.fc_coor_mask.append(MLP(mask_channels,bias=True))
         
         # build assigner      
         if assigner_zero_layer_cfg is not None:
@@ -257,7 +256,7 @@ class PFC(nn.Module):
         voxel_feats = self.pre_norm(voxel_feats)
         return voxel_feats,voxel_coors
 
-    def mpe(self, features, voxel_coors, batch_size):
+    def mpe(self, features, voxel_coors, batch_size): # 要修改
         """Encode features with sparse indices."""
 
         if self.pe_type is not None:
@@ -339,12 +338,12 @@ class PFC(nn.Module):
             outputs_mask = self.mask_proj(sem_queries.transpose(1,2)).transpose(1,2).unsqueeze(3) # [1,256,768]  
 
             for b in range(len(pe_features)):
-                maskpool_embeddings = self.mask_pooling(x=pe_features[b].unsqueeze(0).unsqueeze(3),mask=outputs_mask[b].unsqueeze(0))
+                maskpool_embeddings = self.mask_pooling(x=pe_features[b].unsqueeze(0).unsqueeze(3),mask=outputs_mask)
                 maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings.transpose(1,2)).squeeze(0)
                 sem_pred = get_classification_logits(maskpool_embeddings,text_features,self.logit_scale)
                 # sem_pred = torch.einsum("nc,vc->vn", sem_queries[b], pe_features[b])
                 sem_preds.append(sem_pred)
-                stuff_queries = sem_queries[b][self.stuff_class] # [5,256]
+                stuff_queries = sem_queries[b][self.stuff_class].clone() # [5,256]
                 queries[b] = torch.cat([queries[b], stuff_queries], dim=0) # [133,256]
 
         return queries, pe_features, mpe, sem_preds
@@ -376,10 +375,11 @@ class PFC(nn.Module):
         if layer != 0:
             cls_queries = queries
             cls_pred = self.fc_cls[layer](cls_queries) # [139,768]
+            # 添加与text_features交互
         else:
             cls_pred = None
 
-        return cls_pred, mask_pred, pos_mask_pred
+        return cls_pred, mask_pred, pos_mask_pred.sigmoid()
     
     def forward_vision_features(self,features,voxel_coors,text_features):
         class_preds_buffer = []
@@ -483,7 +483,6 @@ class PFC(nn.Module):
                                                       num_points)
             sem_stuff_weights = torch.eye(
                 len(self.stuff_class), device=positive_gt_masks.device)
-            # sem_thing_weights = positive_gt_masks.new_zeros((len(self.stuff_class),len(self.thing_class)))
             sem_label_weights = label_weights.new_zeros(len(self.stuff_class), len(self.total_class)).float()
             sem_label_weights[:, self.stuff_class] = sem_stuff_weights
 
@@ -529,15 +528,19 @@ class PFC(nn.Module):
             for unq_pan in unique_panoptic_label:
                 unq_sem = unq_pan & 0xFFFF
                 if unq_sem in self.thing_class:
-                    label.append(unq_sem)
-                    mask.append(gt_panoptici_label == unq_pan)
+                    if (gt_panoptici_label == unq_pan).sum()>self.minpoint:
+                        label.append(unq_sem)
+                        tmp_mask = gt_panoptici_label == unq_pan
+                        mask.append(tmp_mask)
 
             for unq_sem in unique_semantic_label:
                 if (unq_sem in self.thing_class) or (unq_sem
                                                      == self.ignore_index):
                     continue
-                label.append(unq_sem)
-                mask.append(semantic_label == unq_sem)
+                if (semantic_label==unq_sem).sum()>self.minpoint:
+                    label.append(unq_sem)
+                    tmp_mask = semantic_label == unq_sem
+                    mask.append(tmp_mask)
 
             if len(label) > 0:
                 label = torch.stack(label, dim=0)
@@ -546,8 +549,10 @@ class PFC(nn.Module):
                 label = semantic_label.new_zeros(size=[0])
                 mask = semantic_label.new_zeros(
                     size=[0, semantic_label.shape[-1]])
-
+                
+            
             label, mask = label.long(), mask.long()
+            
             labels.append(label)
             masks.append(mask)
 
@@ -578,8 +583,10 @@ class PFC(nn.Module):
         for b in range(len(mask_preds[0])):
             thing_masks_pred_detach = mask_preds[0][b][:self.num_queries,:].detach()
             # 取可见的部分
-            grid_mask = batch_data_samples['grid_mask'][b]
-            thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[grid_mask].permute(1,0)
+            voxel2point_map = batch_data_samples['voxel2point_map'][b]
+            seenmask = batch_data_samples['seenmask'][b]
+            seen_unique_indices = batch_data_samples['seen_unique_indices'][b]
+            thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[voxel2point_map][seenmask[:,0]][seen_unique_indices].permute(1,0)
             
             sampled_gt_instances = InstanceData(
                 labels=gt_thing_classes[b], masks=gt_thing_masks[b])
@@ -613,8 +620,10 @@ class PFC(nn.Module):
                 # thing_class_pred_detach = thing_class_pred_detach[...,:-1]
                 thing_masks_pred_detach = thing_masks_pred_detach = mask_preds[layer][b][:self.num_queries,:].detach()
                 # 取可见的部分
-                grid_mask = batch_data_samples['grid_mask'][b]
-                thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[grid_mask].permute(1,0)
+                voxel2point_map = batch_data_samples['voxel2point_map'][b]
+                seenmask = batch_data_samples['seenmask'][b]
+                seen_unique_indices = batch_data_samples['seen_unique_indices'][b]
+                thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[voxel2point_map][seenmask[:,0]][seen_unique_indices].permute(1,0)
                 
                 sampled_gt_instances = InstanceData(
                     labels=gt_thing_classes[b], masks=gt_thing_masks[b])
@@ -651,7 +660,7 @@ class PFC(nn.Module):
         semantic_preds = []
         instance_ids = []
         for i in range(len(class_preds)):
-            class_pred = F.softmax(class_preds[i] , dim=-1)
+            class_pred = class_preds[i] 
             mask_pred = mask_preds[i]
 
             scores = class_pred[:self.num_queries][:, self.thing_class] # 139 = 128+num_class
@@ -666,7 +675,7 @@ class PFC(nn.Module):
 
             scores = torch.cat([thing_scores, stuff_scores], dim=0)
             labels = torch.cat([thing_labels, stuff_labels], dim=0)
-            # print(torch.unique(scores))
+            print(torch.unique(scores))
             # print(self.score_thr)
 
             keep = ((scores > self.score_thr) & (labels != self.ignore_index))
@@ -746,8 +755,10 @@ class PFC(nn.Module):
                 zip(mask_preds, mask_targets)):
             mp = mpred[bool_pos_inds_split[mask_idx]]
             # 取seen部分
-            grid_mask = train_dict['grid_mask'][mask_idx]
-            mp = mp.permute(1,0)[grid_mask].permute(1,0)
+            voxel2point_map = train_dict['voxel2point_map'][mask_idx]
+            seenmask = train_dict['seenmask'][mask_idx]
+            seen_unique_indices = train_dict['seen_unique_indices'][mask_idx]
+            mp = mp.permute(1,0)[voxel2point_map][seenmask[:,0]][seen_unique_indices].permute(1,0)
             mt = mtarget[bool_pos_inds_split[mask_idx]]
             if len(mp) > 0:
                 valid_bs += 1
@@ -765,8 +776,10 @@ class PFC(nn.Module):
                 zip(mask_preds, mask_targets)):
             mp = mpred[bool_pos_inds_split[mask_idx]]
             # 取seen部分
-            grid_mask = train_dict['grid_mask'][mask_idx]
-            mp = mp.permute(1,0)[grid_mask].permute(1,0)
+            voxel2point_map = train_dict['voxel2point_map'][mask_idx]
+            seenmask = train_dict['seenmask'][mask_idx]
+            seen_unique_indices = train_dict['seen_unique_indices'][mask_idx]
+            mp = mp.permute(1,0)[voxel2point_map][seenmask[:,0]][seen_unique_indices].permute(1,0)
             mt = mtarget[bool_pos_inds_split[mask_idx]]
             if len(mp) > 0:
                 valid_bs += 1
@@ -782,21 +795,19 @@ class PFC(nn.Module):
             valid_bs = 0
             for mask_idx, (mpred, mtarget) in enumerate(
                     zip(pos_mask_preds, mask_targets)):
-                # mpred = mpred[:self.num_queries]
-                # mtarget = mtarget[:self.num_queries]
-                # mp = mpred[bool_pos_inds_split[mask_idx][:self.num_queries]]
                 mp = mpred[bool_pos_inds_split[mask_idx]]
                 # 取seen部分
-                grid_mask = train_dict['grid_mask'][mask_idx]
-                mp = mp.permute(1,0)[grid_mask].permute(1,0)
+                voxel2point_map = train_dict['voxel2point_map'][mask_idx]
+                seenmask = train_dict['seenmask'][mask_idx]
+                seen_unique_indices = train_dict['seen_unique_indices'][mask_idx]
+                mp = mp.permute(1,0)[voxel2point_map][seenmask[:,0]][seen_unique_indices].permute(1,0)
                 mt = mtarget[bool_pos_inds_split[mask_idx]]
-                # mt = mtarget[bool_pos_inds_split[mask_idx][:self.num_queries]]
                 if len(mp) > 0:
                     valid_bs += 1
-                    loss_dice_pos += self.loss_dice(mp, mt)
+                    loss_dice_pos += self.loss_dice(mp, mt) * self.pa_seg_weight
 
             if valid_bs > 0:
-                losses[f'loss_dice_pos_{layer}'] = loss_dice_pos / valid_bs  * self.pa_seg_weight
+                losses[f'loss_dice_pos_{layer}'] = loss_dice_pos / valid_bs
             else:
                 losses[f'loss_dice_pos_{layer}'] = class_preds.sum() * 0.0
 
@@ -819,14 +830,16 @@ class PFC(nn.Module):
             if self.use_sem_loss:
                 seg_label = train_dict['voxel_semantic_labels']# [46838]
                 for b in range(len(sem_preds)):
-                    grid_mask = train_dict['grid_mask'][b]
-                    sem_preds[b] = sem_preds[b][grid_mask]
+                    voxel2point_map = train_dict['voxel2point_map'][b]
+                    seenmask = train_dict['seenmask'][b]
+                    seen_unique_indices = train_dict['seen_unique_indices'][b]
+                    sem_preds[b] = sem_preds[b][voxel2point_map][seenmask[:,0]][seen_unique_indices]
                 seg_label = torch.cat(seg_label, dim=0)
                 sem_preds = torch.cat(sem_preds, dim=0) # [46838, 20]
                 losses['loss_ce'] = self.loss_ce(
-                    sem_preds, seg_label, ignore_index=self.ignore_index)/len(train_dict['voxel_semantic_labels']) # ignore_index=self.ignore_index
+                    sem_preds, seg_label, ignore_index=self.ignore_index)
                 losses['loss_lovasz'] = self.loss_lovasz(
-                    nn.functional.softmax(sem_preds), seg_label, ignore_index=self.ignore_index)/len(train_dict['voxel_semantic_labels'])
+                    sem_preds, seg_label, ignore_index=self.ignore_index)
             return losses
         else:
             mask_cls_results = class_preds_buffer[-1] # [134, 768]
@@ -896,11 +909,11 @@ class MLP(nn.Module):
                         channels[cc + 1],
                         bias=bias),
                     build_norm_layer(
-                        dict(type='LN'), channels[cc + 1])[1],
+                        dict(type='LN'), channels[cc + 1])[1],    
                     build_activation_layer(
                         dict(type=act_type))))
         self.mlp.append(
-            nn.Linear(channels[-2], channels[-1]))
+            nn.Linear(channels[-2], channels[-1],bias=bias))
         
     def forward(self, input):
         for layer in self.mlp:

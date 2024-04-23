@@ -81,6 +81,12 @@ import torch.nn as nn
 
 # checkpoint = torch.load('/home/coisini/project/fc-clip/checkpoints/fcclip_cocopan.pth')
 # print(checkpoint['model'].keys())
-import open_clip
-print(open_clip.list_pretrained())
+# import open_clip
+# print(open_clip.list_pretrained())
 
+# import clip
+# print(clip.available_models())
+
+import os
+print(os.path.basename("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951"))
+print(os.path.dirname("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951.npy"))

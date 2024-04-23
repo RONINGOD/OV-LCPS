@@ -17,6 +17,7 @@ import time
 from dataloader.utils import PCDTransformTool
 from pyquaternion import Quaternion
 import clip
+import copy
 
 def get_parser():
     parser = argparse.ArgumentParser(description="openseg demo for builtin configs")
@@ -28,6 +29,7 @@ def get_parser():
     )
     parser.add_argument("--version",default='v1.0-mini',type=str,help='nuscenes data version')
     parser.add_argument("--split",default='train',type=str,help='nuscenes data split')
+    parser.add_argument("--start",default=0,type=int,help='nuscenes data start id')
     parser.add_argument(
         "--output",
         default='/home/coisini/data/nuscenes_openseg_features',
@@ -95,10 +97,22 @@ def main(args):
         nusc_data = pickle.load(f)['infos']
     CAM_NAME_LIST = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_BACK_LEFT',
                      'CAM_BACK', 'CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT']
-    # NUSCENES_LABELS_16 = ['barrier', 'bicycle', 'bus', 'car', 'construction vehicle', 'motorcycle', 'person', 'traffic cone',
-    #                   'trailer', 'truck', 'drivable surface', 'other flat', 'sidewalk', 'terrain', 'manmade', 'vegetation']
-    # text_features = build_text_embedding(NUSCENES_LABELS_16)
-    # np.save(os.path.join(output,'nuscenes_text_embedding_class16.npy'),text_features)
+    NUSCENES_LABELS_16 = ['barrier', 'bicycle', 'bus', 'car', 'construction vehicle', 'motorcycle', 'person', 'traffic cone',
+                      'trailer', 'truck', 'drivable surface', 'other flat', 'sidewalk', 'terrain', 'manmade', 'vegetation']
+    base_things = ['barrier','bicycle','car','construction_vehicle','traffic_cone',
+                    'trailer','truck']
+    base_stuff = ['driveable_surface','other_flat','sidewalk','terrain','manmade']
+    base_total = base_things+base_stuff
+    novel_things = ['bus','motorcycle','pedestrian']
+    novel_stuff = ['vegetation']
+    novel_total = novel_things+novel_stuff
+    total = base_total+novel_total
+    base_total += ['noise']
+    total += ['noise']
+    text_features = build_text_embedding(base_total)
+    np.save(os.path.join(output,'base_text_features.npy'),text_features)
+    text_features = build_text_embedding(total)
+    np.save(os.path.join(output,'total_text_features.npy'),text_features)
     # load the openseg model
     saved_model_path = args.openseg_model
     args.text_emb = None
@@ -109,11 +123,9 @@ def main(args):
     else:
         args.openseg_model = None
     
-    start_id=0
+    start_id=args.start
     pbar = tqdm(total=len(nusc_data))
     for index,sample_data in enumerate(nusc_data):
-        if index<start_id:
-            continue
         start_time = time.time()
         info = nusc_data[index]
         token = sample_data['token']
@@ -126,9 +138,18 @@ def main(args):
             lidar_path = lidar_path[44:]
         elif version == "v1.0-test":
             lidar_path = lidar_path[16:]
-            
+        pcd_data_name = lidar_path.split('.')[0]
+        img_features_path = os.path.join(output,pcd_data_name+'.npy')
+        # if os.path.exists(img_features_path) or index<start_id:
+        #     pbar.set_postfix({
+        #         "token":sample_data['token'],
+        #         "finished in ":"{:.2f}s".format(time.time()-start_time)
+        #     })
+        #     pbar.update(1)
+        #     continue
+
         points = np.fromfile(os.path.join(data_root, lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])
-        pcd_trans_tool = PCDTransformTool(points[:, :3])
+        pcd = PCDTransformTool(points[:, :3])
         n_points_cur = points.shape[0]
         rec = nusc.get('sample', token)
         num_img = len(CAM_NAME_LIST)
@@ -143,6 +164,7 @@ def main(args):
             # Points live in the point sensor frame. So they need to be transformed via global to the image plane.
             # First step: transform the pointcloud to the ego vehicle frame for the timestamp of the sweep.
             cs_record = nusc.get('calibrated_sensor', cam_channel['calibrated_sensor_token'])
+            pcd_trans_tool = copy.deepcopy(pcd)
             pcd_trans_tool.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
             pcd_trans_tool.translate(np.array(cs_record['translation']))
             # Second step: transform from ego to the global frame at timestamp of the first frame in the sequence pack.
@@ -183,7 +205,6 @@ def main(args):
             feat_2d_3d = feat_2d[:, mapping_3d[:, 1], mapping_3d[:, 2]].permute(1, 0)
             counter[mask!=0]+= 1
             sum_features[mask!=0] += feat_2d_3d[mask!=0]
-            del feat_2d
             
         counter[counter==0] = 1e-5
         feat_bank = sum_features/counter
@@ -192,12 +213,12 @@ def main(args):
         mask = torch.zeros(n_points_cur, dtype=torch.bool)
         mask[point_ids] = True
         feat_save = feat_bank[mask].numpy()
-        pcd_data_name = lidar_path.split('.')[0]
-        img_features_path = os.path.join(output,pcd_data_name+'.npy')
+        mask = mask.numpy()
         dir_name = os.path.dirname(img_features_path)
         make_file(dir_name)
-        np.save(img_features_path,feat_save)
-        del feat_bank    
+        save_dict = {"point_feat": feat_save,
+                     "point_mask": mask}
+        np.save(img_features_path,save_dict)   
         pbar.set_postfix({
             "token":sample_data['token'],
             "finished in ":"{:.2f}s".format(time.time()-start_time)

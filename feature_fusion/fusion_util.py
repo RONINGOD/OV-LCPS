@@ -102,35 +102,6 @@ def save_fused_feature(feat_bank, point_ids, n_points, out_dir, scene_id, args):
         },  os.path.join(out_dir, scene_id +'_%d.pt'%(n)))
         print(os.path.join(out_dir, scene_id +'_%d.pt'%(n)) + ' is saved!')
 
-def build_text_embedding(categories):
-    import clip
-    print(clip.available_models())
-    model, preprocess = clip.load("ViT-L/14@336px")
-    run_on_gpu = torch.cuda.is_available()
-
-    with torch.no_grad():
-        all_text_embeddings = []
-        print("Building text embeddings...")
-        for category in tqdm(categories):
-            texts = clip.tokenize(category)  #tokenize
-        if run_on_gpu:
-            texts = texts.cuda()
-        text_embeddings = model.encode_text(texts)  #embed with text encoder
-
-        text_embeddings /= text_embeddings.norm(dim=-1, keepdim=True)
-
-        text_embedding = text_embeddings.mean(dim=0)
-
-        text_embedding /= text_embedding.norm()
-
-        all_text_embeddings.append(text_embedding)
-
-        all_text_embeddings = torch.stack(all_text_embeddings, dim=1)
-
-        if run_on_gpu:
-            all_text_embeddings = all_text_embeddings.cuda()
-    return all_text_embeddings.cpu().numpy().T
-
 class PointCloudToImageMapper(object):
     def __init__(self, image_dim,
             visibility_threshold=0.25, cut_bound=0, intrinsics=None):

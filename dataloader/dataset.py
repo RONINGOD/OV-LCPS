@@ -19,7 +19,8 @@ from pyquaternion import Quaternion
 import torch_scatter
 from .process_panoptic_ori import PanopticLabelGenerator
 from .instance_augmentation import Instance_Augmentation, Cont_Mix_InstAugmentation
-
+from nuscenes.utils.geometry_utils import view_points
+from nuscenes.utils.data_classes import LidarPointCloud
 
 class SemKITTI_pt(data.Dataset):
     def __init__(self, data_path, cfgs, split='train', return_ref=False):
@@ -408,7 +409,7 @@ class OV_Nuscenes_pt(data.Dataset):
             data = pickle.load(f)
 
         self.learning_map = nuscenesyaml['learning_map']
-        self.fcclip_features_path = cfgs['dataset']['fcclip_feature_path']
+        self.clip_features_path = cfgs['dataset']['clip_feature_path']
         self.split = split
         self.thing_list = [cl for cl, is_thing in nuscenesyaml['thing_class'].items() if is_thing]
         self.stuff_list = [cl for cl, is_stuff in nuscenesyaml['stuff_class'].items() if is_stuff]
@@ -425,11 +426,11 @@ class OV_Nuscenes_pt(data.Dataset):
         self.unseen_class = []
         if self.split =='train':
             self.thing_list = self.base_thing_list
-            self.text_features = np.load(os.path.join(self.fcclip_features_path,'base_text_features.npy'))
+            self.text_features = np.load(os.path.join(self.clip_features_path,'base_text_features.npy'))
             self.stuff_list = self.base_stuff_list
             self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
         else:
-            self.text_features = np.load(os.path.join(self.fcclip_features_path,'total_text_features.npy'))
+            self.text_features = np.load(os.path.join(self.clip_features_path,'total_text_features.npy'))
             
                                          
         # 多模态
@@ -464,66 +465,71 @@ class OV_Nuscenes_pt(data.Dataset):
             lidar_path = info['lidar_path'][16:]
             
         points = np.fromfile(os.path.join(self.data_path, lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])
-        
+        pcd_data_name = lidar_path.split('.')[0]
+        clip_img_features_path = os.path.join(self.clip_features_path,pcd_data_name+'.npy')
+        points_features = np.load(clip_img_features_path,allow_pickle=True).item()
+        clip_features, point_mask = points_features['point_feat'], points_features['point_mask']
+        clip_features = np.array(clip_features).astype('float32')
         # 多模态部分
         if self.pix_fusion:
             camera_channel = []  # 6, H, W, 3
-            fcclip_vision_channel = [] # 6,1536,24,42
-            pixel_coordinates = []  # 6, N, 2
-            masks = []
-            valid_mask = np.array([-1] * points.shape[0])
+            # fcclip_vision_channel = [] # 6,1536,24,42
+            # pixel_coordinates = []  # 6, N, 2
+            # masks = []
+            # valid_mask = np.array([-1] * points.shape[0])
             lidar_token = lidar_sd_token
             lidar_channel = self.nusc.get("sample_data", lidar_token)
             rho = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
-            cosine_value = points[:, 0] / rho
+            # cosine_value = points[:, 0] / rho
             
             for idx, channel in enumerate(self.CAM_CHANNELS):
                 cam_token = info['cams'][channel]['sample_data_token']
                 cam_channel = self.nusc.get('sample_data', cam_token)
-                fcclip_version_features = np.load(os.path.join(self.fcclip_features_path,cam_channel['filename'].split('.')[0]+'.npy'))
+                # fcclip_version_features = np.load(os.path.join(self.fcclip_features_path,cam_channel['filename'].split('.')[0]+'.npy'))
                 im = Image.open(os.path.join(self.nusc.dataroot, cam_channel['filename'])).convert('RGB')
                 camera_channel.append(np.array(self.transform(im)).astype('float32'))
-                fcclip_vision_channel.append(np.array(fcclip_version_features).astype('float32'))
-                pcd_trans_tool = PCDTransformTool(points[:, :3])
-                # Points live in the point sensor frame. So they need to be transformed via global to the image plane.
-                # First step: transform the pointcloud to the ego vehicle frame for the timestamp of the sweep.
-                cs_record = self.nusc.get('calibrated_sensor', lidar_channel['calibrated_sensor_token'])
-                pcd_trans_tool.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
-                pcd_trans_tool.translate(np.array(cs_record['translation']))
+                # fcclip_vision_channel.append(np.array(fcclip_version_features).astype('float32'))
+                # pcd_trans_tool = PCDTransformTool(points[:, :3])
+                # # Points live in the point sensor frame. So they need to be transformed via global to the image plane.
+                # # First step: transform the pointcloud to the ego vehicle frame for the timestamp of the sweep.
+                # cs_record = self.nusc.get('calibrated_sensor', lidar_channel['calibrated_sensor_token'])
+                # pcd_trans_tool.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
+                # pcd_trans_tool.translate(np.array(cs_record['translation']))
 
-                if self.open_asynchronous_compensation:
-                    # Second step: transform from ego to the global frame at timestamp of the first frame in the sequence pack.
-                    poserecord = self.nusc.get('ego_pose', lidar_channel['ego_pose_token'])
-                    pcd_trans_tool.rotate(Quaternion(poserecord['rotation']).rotation_matrix)
-                    pcd_trans_tool.translate(np.array(poserecord['translation']))
+                # if self.open_asynchronous_compensation:
+                #     # Second step: transform from ego to the global frame at timestamp of the first frame in the sequence pack.
+                #     poserecord = self.nusc.get('ego_pose', lidar_channel['ego_pose_token'])
+                #     pcd_trans_tool.rotate(Quaternion(poserecord['rotation']).rotation_matrix)
+                #     pcd_trans_tool.translate(np.array(poserecord['translation']))
                 
-                    # Third step: transform from global into the ego vehicle frame for the timestamp of the image.
-                    poserecord = self.nusc.get('ego_pose', cam_channel['ego_pose_token'])
-                    pcd_trans_tool.translate(-np.array(poserecord['translation']))
-                    pcd_trans_tool.rotate(Quaternion(poserecord['rotation']).rotation_matrix.T)
+                #     # Third step: transform from global into the ego vehicle frame for the timestamp of the image.
+                #     poserecord = self.nusc.get('ego_pose', cam_channel['ego_pose_token'])
+                #     pcd_trans_tool.translate(-np.array(poserecord['translation']))
+                #     pcd_trans_tool.rotate(Quaternion(poserecord['rotation']).rotation_matrix.T)
 
-                # Fourth step: transform from ego into the camera. 
-                # 图像坐标系下的点云，索引clip特征
-                cs_record = self.nusc.get('calibrated_sensor', cam_channel['calibrated_sensor_token'])
-                pcd_trans_tool.translate(-np.array(cs_record['translation']))
-                pcd_trans_tool.rotate(Quaternion(cs_record['rotation']).rotation_matrix.T)
-                mask = np.ones(points.shape[0], dtype=bool)
-                mask = np.logical_and(mask, pcd_trans_tool.pcd[2, :] > 0)
-                # Fifth step: project from 3d coordinate to 2d coordinate
-                pcd_trans_tool.pcd2image(np.array(cs_record['camera_intrinsic']),normalize=True)
-                pixel_coord = pcd_trans_tool.pcd[:2, :]
-                im_width = im.size[0]
-                im_height = im.size[1]
-                mask = np.logical_and(mask,pixel_coord[0,:]<im_width)
-                mask = np.logical_and(mask,pixel_coord[0,:]>0)
-                mask = np.logical_and(mask,pixel_coord[1,:]<im_height)
-                mask = np.logical_and(mask,pixel_coord[1,:]>0)
-                valid_mask[mask] = idx
-                masks.append(mask)
-                pixel_coordinates.append(pixel_coord.T)
+                # # Fourth step: transform from ego into the camera. 
+                # # 图像坐标系下的点云，索引clip特征
+                # cs_record = self.nusc.get('calibrated_sensor', cam_channel['calibrated_sensor_token'])
+                # pcd_trans_tool.translate(-np.array(cs_record['translation']))
+                # pcd_trans_tool.rotate(Quaternion(cs_record['rotation']).rotation_matrix.T)
+                # mask = np.ones(points.shape[0], dtype=bool)
+                # mask = np.logical_and(mask, pcd_trans_tool.pcd[2, :] > 0) # min_dist
+                # # Fifth step: project from 3d coordinate to 2d coordinate
+                # pcd_trans_tool.pcd2image(np.array(cs_record['camera_intrinsic']),normalize=True)
+                # pixel_coord = pcd_trans_tool.pcd[:2, :]
+                # im_width = im.size[0]
+                # im_height = im.size[1]
+                
+                # mask = np.logical_and(mask,pixel_coord[0,:]<im_width-1) # 1600
+                # mask = np.logical_and(mask,pixel_coord[0,:]>0)
+                # mask = np.logical_and(mask,pixel_coord[1,:]<im_height-1)
+                # mask = np.logical_and(mask,pixel_coord[1,:]>0)
+                # valid_mask[mask] = idx
+                # masks.append(mask)
+                # pixel_coordinates.append(pixel_coord.T)
 
             # ori_camera_channel = np.stack(camera_channel, axis=0)
-            ori_clip_vision_channel = np.stack(fcclip_vision_channel,axis=0)
+            # ori_clip_vision_channel = np.stack(fcclip_vision_channel,axis=0)
             for i in range(6):
                 # 归一化
                 camera_channel[i] /= 255.0
@@ -531,9 +537,9 @@ class OV_Nuscenes_pt(data.Dataset):
                 camera_channel[i][:, :, 1] = (camera_channel[i][:, :, 1] - 0.456) / 0.224
                 camera_channel[i][:, :, 2] = (camera_channel[i][:, :, 2] - 0.406) / 0.225
             camera_channel = np.stack(camera_channel, axis=0)
-            pixel_coordinates = np.stack(pixel_coordinates, axis=0)
-            masks = np.stack(masks, axis=0)
-            fusion_tuple = (camera_channel, pixel_coordinates, masks, valid_mask, ori_clip_vision_channel)
+            # pixel_coordinates = np.stack(pixel_coordinates, axis=0)
+            # masks = np.stack(masks, axis=0)
+            fusion_tuple = (camera_channel, clip_features,point_mask)
 
         
         data_tuple = (points[:, :3], points[:, 3], lidar_sd_token)
@@ -545,10 +551,14 @@ class OV_Nuscenes_pt(data.Dataset):
             panoptic_labels_filename = os.path.join(self.nusc.dataroot,
                                                     self.nusc.get('panoptic', lidar_sd_token)['filename'])
             panoptic_label = np.load(panoptic_labels_filename)['data']
-            points_label = np.fromfile(lidarseg_labels_filename, dtype=np.uint8).reshape([-1, 1])
+            # semantic
+            # points_label = np.fromfile(lidarseg_labels_filename, dtype=np.uint8).reshape([-1, 1])
+            # panoptic 
+            points_label = panoptic_label // 1000 
             points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
             noise_mask = points_label == 0
             unseenmask = np.isin(points_label,self.unseen_class)
+            unseenmask = unseenmask.reshape((points_label.shape[0],1))
             points_label[noise_mask] = 17
             data_tuple += (points_label.astype(np.uint8), panoptic_label,unseenmask)
         else:
@@ -920,17 +930,13 @@ class ov_spherical_dataset(data.Dataset):
                 if len(data) == 6:
                     img = fusion_tuple[0]
                     img = img[:, :, ::-1, :]
-                    flip_coor = fusion_tuple[1]
-                    flip_coor[:, :, 0] = -flip_coor[:, :, 0]
-                    fusion_tuple = (img, flip_coor, fusion_tuple[2], fusion_tuple[3], fusion_tuple[4])
+                    fusion_tuple = (img, fusion_tuple[1],fusion_tuple[2])
             elif flip_type == 2:
                 xyz[:, 1] = -xyz[:, 1]
                 if len(data) == 6:
                     img = fusion_tuple[0]
                     img = img[:, :, ::-1, :]
-                    flip_coor = fusion_tuple[1]
-                    flip_coor[:, :, 0] = -flip_coor[:, :, 0]
-                    fusion_tuple = (img, flip_coor, fusion_tuple[2], fusion_tuple[3], fusion_tuple[4])
+                    fusion_tuple = (img, fusion_tuple[1],fusion_tuple[2])
         # fusion_tuple = (camera_channel, pixel_coordinates, masks, valid_mask, ori_clip_vision_channel)
         # 转化成极坐标系
         xyz_pol = cart2polar(xyz) # r ,theti ,z
@@ -949,8 +955,8 @@ class ov_spherical_dataset(data.Dataset):
 
         # 把点转换成其对应的网格坐标，其中加一个1e-8是为了clip后的点，边界上不会越界
         crop_range = max_bound - min_bound
-        intervals = crop_range / (self.grid_size)
-        min_bound = min_bound + [1e-8, 1e-8, 1e-8]
+        intervals = crop_range / (self.grid_size-1)
+        # min_bound = min_bound + [1e-8, 1e-8, 1e-8]
         if (intervals == 0).any(): print("Zero interval!")
         grid_ind = (np.floor((np.clip(xyz_pol, min_bound, max_bound) - min_bound) / intervals)).astype(int) # 每个点是属于哪个格子
         unique_grid_ind,point2voxel_map,voxel2point_map = np.unique(grid_ind,axis=0,return_index=True,return_inverse=True) # 体素化后去重的索引
@@ -960,28 +966,37 @@ class ov_spherical_dataset(data.Dataset):
         dim_array[0] = -1
         voxel_position = np.indices(self.grid_size) * intervals.reshape(dim_array) + min_bound.reshape(dim_array)
         
-        # 索引clip vision features
-        _, pixel_coordinates, camera_masks, _, ori_clip_vision_channel = fusion_tuple    
-        img_indices_channel = []
-        point2img_index_channel = []
+        # 索引clip vision features fusion_tuple = (camera_channel, valid_mask, ori_clip_vision_channel,clip_features)
+        camera_channel,clip_features,point_mask = fusion_tuple    
+        # img_indices_channel = []
+        # point2img_index_channel = []
         pts_instance_mask = insts[seenmask]
         pts_semantic_mask = labels[seenmask]
-        for idx in range(len(pixel_coordinates)):
-            points_img = np.ascontiguousarray(pixel_coordinates[idx])
-            points_img = points_img[camera_masks[idx]]
-            img_indices = np.fliplr(points_img.astype(np.int64))
-            point2img_index = np.arange(len(camera_masks[idx]))[camera_masks[idx]]
-            img_indices_channel.append(img_indices)
-            point2img_index_channel.append(point2img_index)
-            pixel_coordinates[idx]
+        # for idx in range(len(pixel_coordinates)):
+        #     points_img = np.ascontiguousarray(pixel_coordinates[idx])
+        #     points_img = points_img[camera_masks[idx]]
+        #     img_indices = np.fliplr(points_img.astype(np.int64))
+        #     point2img_index = np.arange(len(camera_masks[idx]))[camera_masks[idx]]
+        #     img_indices_channel.append(img_indices)
+        #     point2img_index_channel.append(point2img_index)
+        #     pixel_coordinates[idx]
         
         if type(labels)==np.ndarray and type(insts)==np.ndarray:
             # 生成每个voxel的语义label，单个网格内采用最大投票
             num_points = pts_instance_mask.shape[0]
-            _,seen_unique_indices, unique_indices_inverse = np.unique(grid_ind[seenmask[:,0]], return_inverse=True,return_index=True, axis=0)
+            total_unq = np.unique(grid_ind, axis=0)
+            unq,seen_unique_indices, unique_indices_inverse = np.unique(grid_ind[seenmask[:,0]], return_inverse=True,return_index=True, axis=0)
+            # 寻找索引
+            structured_total_unq = np.core.records.fromarrays(total_unq.transpose())
+            # Create a structured array for unq
+            structured_unq = np.core.records.fromarrays(unq.transpose())
+            # Find the indices
+            grid_mask = np.where(np.in1d(structured_total_unq, structured_unq))[0]
+            bool_array = np.zeros(len(total_unq), dtype=bool)
+            bool_array[grid_mask] = True
+            unq2tuple = (unq[:,0],unq[:,1],unq[:,2])
             unq_instance_labels = np.unique(pts_instance_mask, axis=0).astype(np.int32)
-            sort_instance_labels = np.zeros(pts_instance_mask.shape).astype(np.int32)
-            # map instance labels to [1 - the number of instances]
+            sort_instance_labels = np.zeros(pts_instance_mask.shape).astype(np.int32)            # map instance labels to [1 - the number of instances]
             i = 1
             ins2sem = np.zeros((len(unq_instance_labels),)).astype(np.int32)
             for u in unq_instance_labels:
@@ -1028,26 +1043,15 @@ class ov_spherical_dataset(data.Dataset):
             return_dict['voxel_semantic_labels'] = voxel_semantic_labels
             return_dict['voxel_instance_labels'] = voxel_instance_labels
             return_dict['voxel2point_map'] = voxel2point_map
-            # return_dict['unique_grid_ind'] = unique_grid_ind
             return_dict['point2voxel_map'] = point2voxel_map
             return_dict['seenmask'] = seenmask
             return_dict['seen_unique_indices'] = seen_unique_indices
-            # return_dict['gt_center'] = center
-            # return_dict['gt_offset'] = offset
-            # return_dict['inst_map_sparse'] = processed_inst != 0
-            # return_dict['bev_mask'] = bev_mask
-            # return_dict['pt_sem_label'] = labels
-            # return_dict['pt_ins_label'] = insts
+            return_dict['grid_mask'] = bool_array
 
         if len(data) == 7:
-            # return_dict['camera_channel'] = fusion_tuple[0]
-            return_dict['pixel_coordinates'] = pixel_coordinates
-            # return_dict['masks'] = fusion_tuple[2]
-            # return_dict['valid_mask'] = fusion_tuple[3]
-            # return_dict['ori_camera_channel'] = fusion_tuple[4]
-            return_dict['ori_clip_vision_channel'] = ori_clip_vision_channel
-            return_dict['img_indices_channel'] = img_indices_channel
-            return_dict['point2img_index_channel'] = point2img_index_channel           
+            return_dict['clip_features'] = clip_features
+            return_dict['camera_channel'] = camera_channel 
+            return_dict['point_mask'] = point_mask       
 
         return return_dict
 
@@ -1125,8 +1129,8 @@ def collate_fn_OV(data):
     return_dict = {}
     for i, k in enumerate(data[0]):
         return_dict[k] = [d[k] for d in data]
-    if 'ori_clip_vision_channel' in return_dict:
-        return_dict['ori_clip_vision_channel'] = np.stack(return_dict['ori_clip_vision_channel'])
+    if 'camera_channel' in return_dict:
+        return_dict['camera_channel'] = np.stack(return_dict['camera_channel'])
     if 'text_features' in return_dict:
         return_dict['text_features'] = np.stack(return_dict['text_features'])
     if 'thing_list' in return_dict:

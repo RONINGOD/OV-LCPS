@@ -3,10 +3,10 @@ dataset:
     version: v1.0-mini
     path: /home/coisini/data/nuscenes
     sample_pkl_path: /home/coisini/data/nuscenes/nuscenes_pkl
-    fcclip_feature_path: /home/coisini/data/nuscenes_fcclip_features
+    clip_feature_path: /home/coisini/data/nuscenes_openseg_features
     rotate_aug: True
     flip_aug: True
-    max_volume_space: [ 100, 3.1415926, 3 ]
+    max_volume_space: [ 50, 3.1415926, 3 ]
     min_volume_space: [ 0, -3.1415926, -5 ]
     gt_generator:
         sigma: 5
@@ -20,7 +20,7 @@ dataset:
         inst_flip: True
         inst_add: True
     num_worker: 4
-    min_points: 50
+    min_points: 15
 model:
     pix_fusion: True
     pix_fusion_path: ./checkpoints/resnet18-5c106cde.pth
@@ -31,17 +31,17 @@ model:
     model_save_path: ./nusc_mini.pt
     train_batch_size: 1
     val_batch_size: 1
-    learning_rate: 0.004
-    LR_MILESTONES: [100, 150,200]
+    learning_rate: 0.0001
+    LR_MILESTONES: [24, 32]
     IMAGE_SIZE: [900,1600]
     deconv_layers: 1
     pe_type: 'mpe'
     query_embed_dims: 256
     num_queries: 128
     deconv_hidden_dim: 64
-    fcclip_vision_dim: 1536
-    fcclip_text_dim: 768
-    LR_GAMMA: 0.5
+    clip_vision_dim: 768
+    clip_text_dim: 768
+    LR_GAMMA: 0.2
     check_iter: 162
     max_epoch: 300
     post_proc:

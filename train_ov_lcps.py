@@ -258,8 +258,6 @@ def main():
                 for i_iter_val, val_dict in enumerate(val_dataset_loader):
                     val_dict['voxel2point_map'] = [torch.from_numpy(i) for i in val_dict['voxel2point_map']]
                     val_dict['point2voxel_map'] = [torch.from_numpy(i) for i in val_dict['point2voxel_map']]
-                    val_dict['seenmask'] = [torch.from_numpy(i).cuda() for i in val_dict['seenmask']]
-                    val_dict['seen_unique_indices'] = [torch.from_numpy(i).cuda() for i in val_dict['seen_unique_indices']]
                     val_dict['pol_voxel_ind'] = [torch.from_numpy(i).cuda() for i in val_dict['pol_voxel_ind']]
                     val_dict['voxel_semantic_labels'] = [SemKITTI2train(torch.from_numpy(i)).type(torch.LongTensor).cuda() for i in val_dict['voxel_semantic_labels']]
                     val_dict['voxel_instance_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in val_dict['voxel_instance_labels']]

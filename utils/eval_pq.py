@@ -328,12 +328,12 @@ class OV_PanopticEval:
       matched_gt[[id2idx_gt[id] for id in gt_labels[tp_indexes]]] = True
       matched_pred[[id2idx_pred[id] for id in pred_labels[tp_indexes]]] = True
 
-      if len(counts_gt)>0:
+      # if len(counts_gt)>0:
       # count the FN
-        self.pan_fn[cl] += np.sum(np.logical_and(counts_gt >= self.min_points, matched_gt == False))
-      if len(matched_pred)>0:
+      self.pan_fn[cl] += np.sum(np.logical_and(counts_gt >= self.min_points, matched_gt == False))
+      # if len(matched_pred)>0:
       # count the FP
-        self.pan_fp[cl] += np.sum(np.logical_and(counts_pred >= self.min_points, matched_pred == False))
+      self.pan_fp[cl] += np.sum(np.logical_and(counts_pred >= self.min_points, matched_pred == False))
 
   def getPQ(self):
     # first calculate for all classes

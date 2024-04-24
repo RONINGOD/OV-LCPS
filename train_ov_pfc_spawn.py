@@ -320,10 +320,10 @@ def main(local_rank, args):
                 'best_miou':best_miou,
                 'best_pq':best_pq,
             }
-            save_file_name = os.path.join(os.path.abspath(args.work_dir), f'epoch_{epoch+1}.pth')
+            save_file_name = os.path.join(os.path.abspath(args.work_dir), 'lastest.pth')
             torch.save(dict_to_save, save_file_name)
-            dst_file = osp.join(args.work_dir, 'latest.pth')
-            symlink(save_file_name, dst_file)
+            # dst_file = osp.join(args.work_dir, 'latest.pth')
+            # symlink(save_file_name, dst_file)
         sem_l, class_l, mask_l,dice_l, dice_pos_l = sem_loss,cls_loss,mask_loss,dice_loss,dice_pos_loss
         scheduler_steplr.step()
         epoch += 1

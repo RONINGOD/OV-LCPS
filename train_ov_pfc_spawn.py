@@ -28,6 +28,8 @@ from utils.eval_pq import PanopticEval,OV_PanopticEval
 from utils.metric_util import per_class_iu, fast_hist_crop
 from utils.metric_util import cal_PQ_dagger
 from mmengine import Config
+import pickle
+import shutil
 warnings.filterwarnings("ignore")
 
 def pass_print(*args, **kwargs):
@@ -165,9 +167,9 @@ def main(local_rank, args):
     global_iter = 0
     print_freq = cfg.model.print_freq
     cfg.resume = ''
-    if osp.exists(osp.join(args.work_dir, 'latest.pth')):
-        cfg.resume = osp.join(args.work_dir, 'latest.pth')
-    if args.resume:
+    if osp.exists(osp.join(osp.abspath(args.work_dir), 'latest.pth')):
+        cfg.resume = osp.join(osp.abspath(args.work_dir), 'latest.pth')
+    if args.resume!='':
         cfg.resume = args.resume
     
     print('resume from: ', cfg.resume)
@@ -211,7 +213,7 @@ def main(local_rank, args):
     avg_loss = 0.0
 
     while epoch < cfg['model']['max_epoch']:
-        if local_rank==0:
+        if local_rank < 1:
             print(f"Epoch {epoch} => Start Training...")
         my_model.train()
         
@@ -320,7 +322,7 @@ def main(local_rank, args):
                 'best_miou':best_miou,
                 'best_pq':best_pq,
             }
-            save_file_name = os.path.join(os.path.abspath(args.work_dir), 'lastest.pth')
+            save_file_name = os.path.join(os.path.abspath(args.work_dir), 'latest.pth')
             torch.save(dict_to_save, save_file_name)
             # dst_file = osp.join(args.work_dir, 'latest.pth')
             # symlink(save_file_name, dst_file)
@@ -337,11 +339,22 @@ def main(local_rank, args):
         get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
         get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list])))
         get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(1,True,dtype=bool),np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool))))
+        if distributed:
+            torch.distributed.barrier()
         with torch.no_grad():
             logger.info("epoch: %d   lr: %.5f\n" % (epoch, optimizer.param_groups[0]['lr']))
-            val_bar = tqdm(total=len(val_dataset_loader))
-            if local_rank==0:
+
+            if local_rank < 1:
                 print(f"Epoch {epoch} => Start Evaluation...")
+            if local_rank > 0:
+                save_dict = {
+                    'item1': [],          
+                    'item2': [],
+                    'item3': [],
+                    'item4': [],
+                    'item5': [],
+                }
+            val_bar = tqdm(total=len(val_dataset_loader))
             for i_iter_val, data in enumerate(val_dataset_loader):                  
                 for k in to_cuda_list:
                     if isinstance(data[k],list):
@@ -357,83 +370,125 @@ def main(local_rank, args):
                 val_pt_inst = data['pt_ins_label']
                 for count, i_val_grid in enumerate(val_grid):
                     panoptic = pts_instance_preds[count]
-                    if datasetname == 'SemanticKitti':
-                        sem_gt = np.squeeze(val_pt_labels[count])
-                        inst_gt = np.squeeze(val_pt_inst[count])      
-                    elif datasetname == 'nuscenes':
-                        sem_gt = np.squeeze(val_pt_labels[count])
-                        inst_gt = np.squeeze(val_pt_inst[count])
+                    if local_rank<1:
+                        if datasetname == 'SemanticKitti':
+                            sem_gt = np.squeeze(val_pt_labels[count])
+                            inst_gt = np.squeeze(val_pt_inst[count])      
+                        elif datasetname == 'nuscenes':
+                            sem_gt = np.squeeze(val_pt_labels[count])
+                            inst_gt = np.squeeze(val_pt_inst[count])
+                        else:
+                            raise NotImplementedError
+                        evaluator.addBatch(predict_labels_sem[count], panoptic,sem_gt, inst_gt)
+                        sem_hist_list.append(fast_hist_crop(predict_labels_sem[count],val_pt_labels[count],unique_label))
                     else:
-                        raise NotImplementedError
-                    evaluator.addBatch(predict_labels_sem[count], panoptic,sem_gt, inst_gt)
-                    sem_hist_list.append(fast_hist_crop(predict_labels_sem[count],val_pt_labels[count],unique_label))
+                        save_dict['item1'].append(predict_labels_sem[count])
+                        save_dict['item2'].append(panoptic)
+                        save_dict['item3'].append(val_pt_labels[count])
+                        save_dict['item4'].append(val_pt_inst[count])
+                        save_dict['item5'].append(fast_hist_crop(
+                            predict_labels_sem[count],
+                            val_pt_labels[count],
+                            unique_label))
                     val_bar.set_postfix({"semantic": np.unique(predict_labels_sem[count]), 
                             "instance_id": np.unique(panoptic)})
-                    val_bar.update(1)
+                val_bar.update(1)
         val_bar.close()
-        PQ, SQ, RQ, class_all_PQ, class_all_SQ, class_all_RQ = evaluator.getPQ()
-        miou, ious = evaluator.getSemIoU()
-        logger.info('Validation per class PQ, SQ, RQ and IoU: ')
-        for class_name, class_pq, class_sq, class_rq, class_iou in zip(unique_label_str, class_all_PQ[1:],
-                                                                                class_all_SQ[1:], class_all_RQ[1:],
-                                                                                ious[1:]):
-            logger.info('%20s : %6.8f%%  %6.8f%%  %6.8f%%  %6.8f%%' % (class_name, class_pq * 100, class_sq * 100, class_rq * 100, class_iou * 100))
-        thing_upper_idx_dict = {"nuscenes": 10, "SemanticKitti":8}
-        upper_idx = thing_upper_idx_dict[datasetname]
-        PQ_dagger = cal_PQ_dagger(class_all_PQ, class_all_SQ, upper_idx + 1)
-        PQ_th = np.nanmean(class_all_PQ[1: upper_idx + 1]) # exclude 0
-        SQ_th = np.nanmean(class_all_SQ[1: upper_idx + 1])
-        RQ_th = np.nanmean(class_all_RQ[1: upper_idx + 1])
-        PQ_st = np.nanmean(class_all_PQ[upper_idx+1:])
-        SQ_st = np.nanmean(class_all_SQ[upper_idx+1:])
-        RQ_st = np.nanmean(class_all_RQ[upper_idx+1:])
-        PQ_N_th = np.nanmean(class_all_PQ[val_pt_dataset.novel_thing_list])
-        PQ_N_st = np.nanmean(class_all_PQ[val_pt_dataset.novel_stuff_list])
-        RQ_N_th = np.nanmean(class_all_RQ[val_pt_dataset.novel_thing_list])
-        RQ_N_st = np.nanmean(class_all_RQ[val_pt_dataset.novel_stuff_list])
-        SQ_N_th = np.nanmean(class_all_SQ[val_pt_dataset.novel_thing_list])
-        SQ_N_st = np.nanmean(class_all_SQ[val_pt_dataset.novel_stuff_list])
-        
-        logger_msg1 = 'PQ %.8f  PQ_dagger  %.8f  SQ %.8f  RQ %.8f  |  PQ_th %.8f  SQ_th %.8f  RQ_th %.8f  |  PQ_st %.8f  SQ_st %.8f  RQ_st %.8f  |  PQ_N_th %.8f  PQ_N_st %.8f  RQ_N_th %.8f  RQ_N_st %.8f  SQ_N_th %.8f  SQ_N_st %.8f  |  mIoU %.8f' %(
-                PQ * 100, PQ_dagger * 100, SQ * 100, RQ * 100,
-                PQ_th * 100, SQ_th * 100, RQ_th * 100,
-                PQ_st * 100, SQ_st * 100, RQ_st * 100,
-                PQ_N_th * 100,PQ_N_st*100, RQ_N_th*100, RQ_N_st*100, SQ_N_th*100, SQ_N_st*100,
-                miou * 100)
-        logger.info(logger_msg1)
-        if PQ>best_pq:
-            best_pq = PQ
-            dict_to_save = {
-                'state_dict': my_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler_steplr.state_dict(),
-                'epoch': epoch + 1,
-                'global_iter': global_iter,
-                'best_miou':best_miou,
-                'best_pq':best_pq,
-            }
-            save_file_name = os.path.join(os.path.abspath(args.work_dir), f'best_pq_{PQ}.pth')
-            torch.save(dict_to_save, save_file_name)
-        best_miou = max(best_miou,miou)
-        logger.info('\nCurrent val miou is %.8f while the best val miou is %.8f' %
-                (miou*100, best_miou*100))
-        logger.info('\nCurrent val PQ is %.8f while the best val PQ is %.8f' %
-                (PQ*100, best_pq*100))
-        iou = per_class_iu(sum(sem_hist_list))
-        logger.info('Validation per class iou: ')
-        for class_name, class_iou in zip(unique_label_str, iou):
-            logger.info('%s : %.8f%%' % (class_name, class_iou * 100))
-        val_miou = np.nanmean(iou) * 100
-        logger.info('Current val miou is %.1f' %
-                    val_miou)
-        logger.info('*' * 40)
-        print('*' * 40)
-        sem_l, class_l, dice_l, dice_pos_l,mask_l = np.nanmean(loss_fn_dict['sem_loss']),np.nanmean(loss_fn_dict['class_loss']),\
-                                np.nanmean(loss_fn_dict['dice_loss']), np.nanmean(loss_fn_dict['dice_pos_loss']),np.nanmean(loss_fn_dict['mask_loss'])
-        
-        logger.info(
-            'epoch %d iter %5d, avg_loss: %.4f, semantic loss: %.4f, class loss: %.4f, mask_loss: %.4f ,dice loss: %.4f, dice position loss: %.4f\n' %
-            (epoch, i_iter, avg_loss, sem_l, class_l, mask_l, dice_l, dice_pos_l))
+        if distributed:
+            torch.distributed.barrier()
+            if local_rank > 0:
+                os.makedirs('./tmpdir', exist_ok=True)
+                pickle.dump(save_dict,
+                            open(os.path.join('./tmpdir', 'result_part_{}.pkl'.format(local_rank)), 'wb'))
+            torch.distributed.barrier()
+        if local_rank < 1:
+            if local_rank == 0:
+                world_size = torch.distributed.get_world_size()
+                for i in range(world_size - 1):
+                    part_file = os.path.join('./tmpdir', 'result_part_{}.pkl'.format(i + 1))
+                    cur_dict = pickle.load(open(part_file, 'rb'))
+                    for j in range(len(cur_dict['item1'])):
+                        
+                        # 用实例标签的语义
+                        if datasetname == 'SemanticKitti':
+                            sem_gt = np.squeeze(cur_dict['item3'][j])
+                            inst_gt = np.squeeze(cur_dict['item4'][j])
+                        elif datasetname == 'nuscenes':
+                            sem_gt = np.squeeze(cur_dict['item3'][j])
+                            inst_gt = np.squeeze(cur_dict['item4'][j])
+                        else:
+                            raise NotImplementedError
+
+                        evaluator.addBatch(cur_dict['item1'][j], cur_dict['item2'][j], sem_gt,
+                                        inst_gt)
+                        sem_hist_list.append(cur_dict['item5'][j])
+                if os.path.isdir('./tmpdir'):
+                    shutil.rmtree('./tmpdir')
+            PQ, SQ, RQ, class_all_PQ, class_all_SQ, class_all_RQ = evaluator.getPQ()
+            miou, ious = evaluator.getSemIoU()
+            logger.info('Validation per class PQ, SQ, RQ and IoU: ')
+            for class_name, class_pq, class_sq, class_rq, class_iou in zip(unique_label_str, class_all_PQ[1:],
+                                                                                    class_all_SQ[1:], class_all_RQ[1:],
+                                                                                    ious[1:]):
+                logger.info('%20s : %6.8f%%  %6.8f%%  %6.8f%%  %6.8f%%' % (class_name, class_pq * 100, class_sq * 100, class_rq * 100, class_iou * 100))
+            thing_upper_idx_dict = {"nuscenes": 10, "SemanticKitti":8}
+            upper_idx = thing_upper_idx_dict[datasetname]
+            PQ_dagger = cal_PQ_dagger(class_all_PQ, class_all_SQ, upper_idx + 1)
+            PQ_th = np.nanmean(class_all_PQ[1: upper_idx + 1]) # exclude 0
+            SQ_th = np.nanmean(class_all_SQ[1: upper_idx + 1])
+            RQ_th = np.nanmean(class_all_RQ[1: upper_idx + 1])
+            PQ_st = np.nanmean(class_all_PQ[upper_idx+1:])
+            SQ_st = np.nanmean(class_all_SQ[upper_idx+1:])
+            RQ_st = np.nanmean(class_all_RQ[upper_idx+1:])
+            PQ_N_th = np.nanmean(class_all_PQ[val_pt_dataset.novel_thing_list])
+            PQ_N_st = np.nanmean(class_all_PQ[val_pt_dataset.novel_stuff_list])
+            RQ_N_th = np.nanmean(class_all_RQ[val_pt_dataset.novel_thing_list])
+            RQ_N_st = np.nanmean(class_all_RQ[val_pt_dataset.novel_stuff_list])
+            SQ_N_th = np.nanmean(class_all_SQ[val_pt_dataset.novel_thing_list])
+            SQ_N_st = np.nanmean(class_all_SQ[val_pt_dataset.novel_stuff_list])
+            
+            logger_msg1 = 'PQ %.8f  PQ_dagger  %.8f  SQ %.8f  RQ %.8f  |  PQ_th %.8f  SQ_th %.8f  RQ_th %.8f  |  PQ_st %.8f  SQ_st %.8f  RQ_st %.8f  |  PQ_N_th %.8f  PQ_N_st %.8f  RQ_N_th %.8f  RQ_N_st %.8f  SQ_N_th %.8f  SQ_N_st %.8f  |  mIoU %.8f' %(
+                    PQ * 100, PQ_dagger * 100, SQ * 100, RQ * 100,
+                    PQ_th * 100, SQ_th * 100, RQ_th * 100,
+                    PQ_st * 100, SQ_st * 100, RQ_st * 100,
+                    PQ_N_th * 100,PQ_N_st*100, RQ_N_th*100, RQ_N_st*100, SQ_N_th*100, SQ_N_st*100,
+                    miou * 100)
+            logger.info(logger_msg1)
+            if PQ>best_pq:
+                best_pq = PQ
+                dict_to_save = {
+                    'state_dict': my_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler_steplr.state_dict(),
+                    'epoch': epoch + 1,
+                    'global_iter': global_iter,
+                    'best_miou':best_miou,
+                    'best_pq':best_pq,
+                }
+                save_file_name = os.path.join(os.path.abspath(args.work_dir), f'best_pq_{PQ}.pth')
+                torch.save(dict_to_save, save_file_name)
+            best_miou = max(best_miou,miou)
+            logger.info('Current val miou is %.8f while the best val miou is %.8f' %
+                    (miou*100, best_miou*100))
+            logger.info('Current val PQ is %.8f while the best val PQ is %.8f' %
+                    (PQ*100, best_pq*100))
+            iou = per_class_iu(sum(sem_hist_list))
+            logger.info('Validation per class iou: ')
+            for class_name, class_iou in zip(unique_label_str, iou):
+                logger.info('%s : %.8f%%' % (class_name, class_iou * 100))
+            val_miou = np.nanmean(iou) * 100
+            logger.info('Current val miou is %.1f' %
+                        val_miou)
+            logger.info('*' * 40)
+            print('*' * 40)
+            sem_l, class_l, dice_l, dice_pos_l,mask_l = np.nanmean(loss_fn_dict['sem_loss']),np.nanmean(loss_fn_dict['class_loss']),\
+                                    np.nanmean(loss_fn_dict['dice_loss']), np.nanmean(loss_fn_dict['dice_pos_loss']),np.nanmean(loss_fn_dict['mask_loss'])
+            
+            logger.info(
+                'epoch %d iter %5d, avg_loss: %.4f, semantic loss: %.4f, class loss: %.4f, mask_loss: %.4f ,dice loss: %.4f, dice position loss: %.4f\n' %
+                (epoch, i_iter, avg_loss, sem_l, class_l, mask_l, dice_l, dice_pos_l))
+        if distributed:
+            torch.distributed.barrier()
 
             
 

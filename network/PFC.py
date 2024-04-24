@@ -30,7 +30,7 @@ class PFC(nn.Module):
                  iou_thr = 0.5,
                  geometric_ensemble_alpha = 0.0, # 0
                  geometric_ensemble_beta = 1.0, # 1
-                 ignore_index = 16,
+                 ignore_index = 0,
                  init_logit_scale = 4.6052,
                  clip_model_name = 'convnext_large_d_320',
                  clip_model_pretrain = 'laion2b_s29b_b131k_ft_soup',
@@ -52,7 +52,7 @@ class PFC(nn.Module):
         super(PFC, self).__init__()
         self.nclasses = nclasses
         self.minpoint = 0
-        self.ignore_index = nclasses-1
+        self.ignore_index = ignore_index
         self.score_thr = score_thr
         self.num_decoder_layers = num_decoder_layers
         self.clip_vision_dim = cfgs['model']['clip_vision_dim']
@@ -495,7 +495,7 @@ class PFC(nn.Module):
                 sem_weights[sem_inds] = 1
 
             label_weights[:, self.stuff_class] = 0
-            label_weights[:, len(self.total_class)-1] = 0
+            label_weights[:, self.ignore_index] = 0
             labels = torch.cat([labels, sem_labels])
             label_weights = torch.cat([label_weights, sem_label_weights])
             mask_targets = torch.cat([mask_targets, sem_targets])
@@ -675,7 +675,7 @@ class PFC(nn.Module):
             cur_classes = labels[keep]  # [pos_proposal_num]
             cur_masks = mask_pred[keep]  # [pos_proposal_num, pt_num]
             cur_masks = cur_masks.sigmoid()
-            print(torch.unique(cur_classes))
+
             semantic_pred = cur_classes.new_full((cur_masks.shape[-1], ),
                                                  self.ignore_index)
             instance_id = cur_classes.new_full((cur_masks.shape[-1], ),
@@ -689,7 +689,7 @@ class PFC(nn.Module):
             # print(torch.unique())
             cur_prob_masks = cur_masks * cur_scores.reshape(-1, 1)
             cur_mask_ids = cur_prob_masks.argmax(0) # cur_mask_ids全0学不到东西
-            print(torch.unique(cur_mask_ids))
+
             id = 1
 
             for k in range(cur_classes.shape[0]):
@@ -717,7 +717,7 @@ class PFC(nn.Module):
         losses = dict()
 
         class_targets = torch.cat(class_targets, 0)
-        pos_inds = (class_targets != len(self.total_class)) & (
+        pos_inds = (class_targets != self.ignore_index) & (
             class_targets < len(self.total_class))
         bool_pos_inds = pos_inds.type(torch.bool)
         bool_pos_inds_split = bool_pos_inds.reshape(batch_size, -1)
@@ -865,18 +865,16 @@ class PFC(nn.Module):
             semantic_preds, instance_ids = self.generate_panoptic_results(class_results_buffer, mask_pred_results)
             semantic_preds = torch.cat(semantic_preds)
             instance_ids = torch.cat(instance_ids)
-            print(torch.unique(semantic_preds))
-            print(torch.unique(instance_ids))
             pts_semantic_preds = []
             pts_instance_preds = []
             for batch_idx in range(batch_size):
-                semantic_sample = semantic_preds[voxel_coors[:, 0] == batch_idx]
-                instance_sample = instance_ids[voxel_coors[:, 0] == batch_idx]
-                voxel2point_map = train_dict['voxel2point_map'][batch_idx]
+                semantic_sample = semantic_preds[voxel_coors[:, 0] == batch_idx].cpu()
+                instance_sample = instance_ids[voxel_coors[:, 0] == batch_idx].cpu()
+                voxel2point_map = train_dict['voxel2point_map'][batch_idx].cpu()
                 point_semantic_sample = semantic_sample[voxel2point_map]
                 point_instance_sample = instance_sample[voxel2point_map]
-                pts_semantic_preds.append(point_semantic_sample.cpu().numpy())
-                pts_instance_preds.append(point_instance_sample.cpu().numpy())
+                pts_semantic_preds.append(point_semantic_sample.numpy())
+                pts_instance_preds.append(point_instance_sample.numpy())
             
             return pts_semantic_preds, pts_instance_preds
 

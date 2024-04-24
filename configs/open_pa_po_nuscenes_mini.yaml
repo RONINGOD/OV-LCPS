@@ -22,6 +22,7 @@ dataset:
     num_worker: 4
     min_points: 15
 model:
+    print_freq: 50
     pix_fusion: True
     pix_fusion_path: ./checkpoints/resnet18-5c106cde.pth
     use_sara: True
@@ -29,8 +30,8 @@ model:
     model_load_path: null
     scatter_points_mode: 'mean'
     model_save_path: ./nusc_mini.pt
-    train_batch_size: 1
-    val_batch_size: 1
+    train_batch_size: 2
+    val_batch_size: 2
     learning_rate: 0.0001
     LR_MILESTONES: [24, 32]
     IMAGE_SIZE: [900,1600]

@@ -556,10 +556,10 @@ class OV_Nuscenes_pt(data.Dataset):
             # panoptic 
             points_label = panoptic_label // 1000 
             points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
-            noise_mask = points_label == 0
+            # noise_mask = points_label == 0
             unseenmask = np.isin(points_label,self.unseen_class)
             unseenmask = unseenmask.reshape((points_label.shape[0],1))
-            points_label[noise_mask] = 17
+            # points_label[noise_mask] = 17
             data_tuple += (points_label.astype(np.uint8), panoptic_label,unseenmask)
         else:
             data_tuple += (-1, -1,-1)
@@ -1056,7 +1056,7 @@ class ov_spherical_dataset(data.Dataset):
         return return_dict
 
 
-@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])', cache=True, parallel=False)
+@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])',nopython=True,  cache=True, parallel=False)
 def nb_process_label(processed_label, sorted_label_voxel_pair):
     label_size = 256
     counter = np.zeros((label_size,), dtype=np.uint16)
@@ -1072,7 +1072,7 @@ def nb_process_label(processed_label, sorted_label_voxel_pair):
     processed_label[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[2]] = np.argmax(counter)
     return processed_label
 
-@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])', cache=True, parallel=False)
+@nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])',nopython=True, cache=True, parallel=False)
 def nb_process_inst_ov(processed_inst, sorted_inst_voxel_pair):
     label_size = 256
     counter = np.zeros((label_size,), dtype=np.uint16)
@@ -1088,7 +1088,7 @@ def nb_process_inst_ov(processed_inst, sorted_inst_voxel_pair):
     processed_inst[cur_sear_ind[0], cur_sear_ind[1], cur_sear_ind[1]] = np.argmax(counter)
     return processed_inst
 
-@nb.jit('u1[:,:](u1[:,:],i8[:,:])', cache=True, parallel=False)
+@nb.jit('u1[:,:](u1[:,:],i8[:,:])',nopython=True,  cache=True, parallel=False)
 def nb_process_inst(processed_inst, sorted_inst_voxel_pair):
     label_size = 256
     counter = np.zeros((label_size,), dtype=np.uint16)
@@ -1155,8 +1155,8 @@ def collate_dataset_info(cfgs):
         with open("nuscenes.yaml", 'r') as stream:
             nuscenesyaml = yaml.safe_load(stream)
         nuscenes_label_name = nuscenesyaml['labels_16']
-        unique_label = np.asarray(sorted(list(nuscenes_label_name.keys())))[1:] - 1
-        unique_label_str = [nuscenes_label_name[x] for x in unique_label + 1]
+        unique_label = np.asarray(sorted(list(nuscenes_label_name.keys())))[1:]
+        unique_label_str = [nuscenes_label_name[x] for x in unique_label]
         return unique_label, unique_label_str
     else:
         raise NotImplementedError

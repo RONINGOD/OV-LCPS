@@ -30,4 +30,4 @@ def cal_PQ_dagger(pq_arr, sq_arr, upper_idx):
             pq_arr_tmp.append(sq_arr[idx].item())
         else:
             pq_arr_tmp.append(pq_arr[idx].item())
-    return np.nanmean(np.array(pq_arr_tmp[1:-1])) # exclude 0 and the No.17/No.20
+    return np.nanmean(np.array(pq_arr_tmp[1:])) # exclude 0 and the No.17/No.20

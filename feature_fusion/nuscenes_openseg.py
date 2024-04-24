@@ -107,8 +107,8 @@ def main(args):
     novel_stuff = ['vegetation']
     novel_total = novel_things+novel_stuff
     total = base_total+novel_total
-    base_total += ['noise']
-    total += ['noise']
+    base_total = ['noise'] + base_total
+    total = ['noise'] + total
     text_features = build_text_embedding(base_total)
     np.save(os.path.join(output,'base_text_features.npy'),text_features)
     text_features = build_text_embedding(total)

@@ -252,7 +252,7 @@ def main():
             get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
             get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.thing_list)))
             get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(val_pt_dataset.stuff_list)))
-            get_model(my_model).c = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list,17]))))
+            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(SemKITTI2train(np.hstack([val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list,17]))))
             get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool),np.full(1,True,dtype=bool))))
             with torch.no_grad():
                 for i_iter_val, val_dict in enumerate(val_dataset_loader):

@@ -22,6 +22,13 @@ dataset:
     num_worker: 4
     min_points: 15
 model:
+    backbone:
+        type: '_Asymm3DSpconv'
+        grid_size: [480,360,32]
+        input_channels: 16
+        base_channels: 32
+        norm_cfg: 
+          type: 'BN1d', eps=1e-5, momentum=0.1)
     geometric_ensemble: False
     geometric_ensemble_alpha: 0.5
     geometric_ensemble_beta: 0.5

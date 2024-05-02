@@ -37,7 +37,8 @@ def pass_print(*args, **kwargs):
 
 def main(local_rank, args):
     # global settings
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True  # 是否自动加速，自动选择合适算法，false选择固定算法
+    torch.backends.cudnn.deterministic = True  # 为了消除该算法本身的不确定性
 
     # load config
     with open(args.configs, 'r') as s:
@@ -51,7 +52,7 @@ def main(local_rank, args):
         cfg.gpu_ids = [0]         # debug
     else:
         distributed = True
-        seed = 1
+        seed = 3407
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -227,7 +228,7 @@ def main(local_rank, args):
             logger.info(f'cumulative_iters: {cumulative_iters}, total_iters: {total_iters}, \
                         divisible_iters: {divisible_iters}, remainder_iters: {remainder_iters}')
         loss_list = []
-        time.sleep(5)
+        # time.sleep(1)
         data_time_s = time.time()
         time_s = time.time()
         bar = tqdm(total=len(train_dataset_loader))
@@ -239,6 +240,8 @@ def main(local_rank, args):
         get_model(my_model).stuff_class = np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(train_pt_dataset.stuff_list)
         get_model(my_model).total_class = np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list]))
         get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
+        if distributed:
+            torch.distributed.barrier()
         for i_iter, data in enumerate(train_dataset_loader):
             for k in to_cuda_list:
                 if isinstance(data[k],list):
@@ -310,7 +313,8 @@ def main(local_rank, args):
                 "avg_loss": avg_loss})
             bar.update(1)
         bar.close()
-        
+        if distributed:
+            torch.distributed.barrier()
         # save checkpoint
         if dist.get_rank() == 0:
             dict_to_save = {
@@ -339,8 +343,7 @@ def main(local_rank, args):
         get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
         get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list])))
         get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(1,True,dtype=bool),np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool))))
-        if distributed:
-            torch.distributed.barrier()
+
         with torch.no_grad():
             logger.info("epoch: %d   lr: %.5f\n" % (epoch, optimizer.param_groups[0]['lr']))
 
@@ -397,15 +400,15 @@ def main(local_rank, args):
         if distributed:
             torch.distributed.barrier()
             if local_rank > 0:
-                os.makedirs('./tmpdir', exist_ok=True)
+                os.makedirs(osp.join(osp.abspath(args.work_dir),'tmpdir'), exist_ok=True)
                 pickle.dump(save_dict,
-                            open(os.path.join('./tmpdir', 'result_part_{}.pkl'.format(local_rank)), 'wb'))
+                            open(os.path.join(osp.abspath(args.work_dir),'tmpdir', 'result_part_{}.pkl'.format(local_rank)), 'wb'))
             torch.distributed.barrier()
         if local_rank < 1:
             if local_rank == 0:
                 world_size = torch.distributed.get_world_size()
                 for i in range(world_size - 1):
-                    part_file = os.path.join('./tmpdir', 'result_part_{}.pkl'.format(i + 1))
+                    part_file = os.path.join(osp.abspath(args.work_dir),'tmpdir', 'result_part_{}.pkl'.format(i + 1))
                     cur_dict = pickle.load(open(part_file, 'rb'))
                     for j in range(len(cur_dict['item1'])):
                         
@@ -422,8 +425,8 @@ def main(local_rank, args):
                         evaluator.addBatch(cur_dict['item1'][j], cur_dict['item2'][j], sem_gt,
                                         inst_gt)
                         sem_hist_list.append(cur_dict['item5'][j])
-                if os.path.isdir('./tmpdir'):
-                    shutil.rmtree('./tmpdir')
+                if os.path.isdir(osp.join(osp.abspath(args.work_dir),'tmpdir')):
+                    shutil.rmtree(osp.join(osp.abspath(args.work_dir),'tmpdir'))
             PQ, SQ, RQ, class_all_PQ, class_all_SQ, class_all_RQ = evaluator.getPQ()
             miou, ious = evaluator.getSemIoU()
             logger.info('Validation per class PQ, SQ, RQ and IoU: ')
@@ -480,7 +483,7 @@ def main(local_rank, args):
             logger.info('Current val miou is %.1f' %
                         val_miou)
             logger.info('*' * 40)
-            print('*' * 40)
+            # print('*' * 40)
             sem_l, class_l, dice_l, dice_pos_l,mask_l = np.nanmean(loss_fn_dict['sem_loss']),np.nanmean(loss_fn_dict['class_loss']),\
                                     np.nanmean(loss_fn_dict['dice_loss']), np.nanmean(loss_fn_dict['dice_pos_loss']),np.nanmean(loss_fn_dict['mask_loss'])
             
@@ -489,6 +492,8 @@ def main(local_rank, args):
                 (epoch, i_iter, avg_loss, sem_l, class_l, mask_l, dice_l, dice_pos_l))
         if distributed:
             torch.distributed.barrier()
+    if distributed:
+        torch.distributed.destroy_process_group()
 
             
 
@@ -511,4 +516,6 @@ if __name__ == '__main__':
         main(0, args)
     else:
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
+# python train_ov_pfc_spawn.py --launcher pytorch -c configs/open_pa_po_nuscenes_mini.yaml -w work_dir/nusc_pfc/mini
+# python train_openseg_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes.yaml -w work_dir/nusc_pfc/
 # python train_ov_pfc_spawn.py --launcher pytorch -c configs/open_pa_po_nuscenes_mini.yaml -w work_dir/nusc_pfc/mini

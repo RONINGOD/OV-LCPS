@@ -87,6 +87,12 @@ import torch.nn as nn
 # import clip
 # print(clip.available_models())
 
-import os
-print(os.path.basename("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951"))
-print(os.path.dirname("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951.npy"))
+# import os
+# print(os.path.basename("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951"))
+# print(os.path.dirname("/home/coisini/data/nuscenes_openseg_features/samples/LIDAR_TOP/n015-2018-07-24-11-22-45+0800__LIDAR_TOP__1532402927647951.npy"))
+
+preds = torch.rand([133,13])
+targes = torch.randint(low=0,high=12,size=[133])
+weights = torch.rand([13,13])
+from mmdet.models.losses import cross_entropy
+print(cross_entropy(preds,targes))

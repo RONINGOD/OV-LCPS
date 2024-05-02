@@ -27,9 +27,9 @@ class PFC(nn.Module):
                  pa_seg_weight = 0.2,
                  num_decoder_layers=6,
                  score_thr = 0.4,
-                 iou_thr = 0.5,
-                 geometric_ensemble_alpha = 0.0, # 0
-                 geometric_ensemble_beta = 1.0, # 1
+                 iou_thr = 0.6,
+                 geometric_ensemble_alpha = 0.8, # 0
+                 geometric_ensemble_beta = 0.4, # 1
                  ignore_index = 0,
                  init_logit_scale = 4.6052,
                  clip_model_name = 'convnext_large_d_320',
@@ -44,7 +44,8 @@ class PFC(nn.Module):
                  assigner_cfg=dict(
                     type='mmdet.HungarianAssigner',
                     match_costs=[
-                            dict(type='mmdet.FocalLossCost', gamma=4.0,alpha=0.25,weight=1.0),
+                            # dict(type='mmdet.FocalLossCost', gamma=4.0,alpha=0.25,weight=1.0),
+                            dict(type='mmdet.CrossEntropyLossCost',weight=1.0),
                             dict(type='mmdet.FocalLossCost', weight=1.0, binary_input=True, gamma=2.0, alpha=0.25),
                             dict(type='mmdet.DiceCost', weight=2.0, pred_act=True),
                     ]),
@@ -85,8 +86,9 @@ class PFC(nn.Module):
         self.map_stuff_class = None
         self.map_thing_class = None
         self.iou_thr = iou_thr
-        self.geometric_ensemble_alpha = geometric_ensemble_alpha
-        self.geometric_ensemble_beta = geometric_ensemble_beta
+        self.geometric_ensemble = cfgs['model']['geometric_ensemble']
+        self.geometric_ensemble_alpha = cfgs['model']['geometric_ensemble_alpha']
+        self.geometric_ensemble_beta = cfgs['model']['geometric_ensemble_beta']
         self.loss_cls = MODELS.build(cfgs['model']['loss_cls'])
         self.loss_mask = MODELS.build(cfgs['model']['loss_mask'])
         self.loss_dice = MODELS.build(cfgs['model']['loss_dice'])
@@ -132,7 +134,8 @@ class PFC(nn.Module):
         self.mask_embed = MLP((self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
         self.mask_proj = MLP((self.nclasses,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
         self.pe_vision_proj = MLP((self.clip_vision_dim,self.query_embed_dims,self.query_embed_dims,self.query_embed_dims),act_type='ReLU',bias=True)
-        self.mask_features = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=1, stride=1, padding=0)
+        self.mask_features = nn.Conv1d(in_channels=self.clip_vision_dim, out_channels=self.clip_vision_dim, kernel_size=1, stride=1, padding=0)
+        xavier_init(self.mask_features)
         self.mask_pooling = MaskPooling()
         self._mask_pooling_proj = MLP((self.query_embed_dims,self.query_embed_dims,self.query_embed_dims,self.fcclip_text_dim))
         if self.pe_type == 'polar' or self.pe_type == 'cart':
@@ -345,7 +348,10 @@ class PFC(nn.Module):
                 # sem_pred = torch.einsum("nc,vc->vn", sem_queries[b], pe_features[b])
                 sem_preds.append(sem_pred)
                 stuff_queries = sem_queries[b][self.stuff_class] # [5,256]
+                # thing_queries = 
                 queries[b] = torch.cat([queries[b], stuff_queries], dim=0) # [133,256]
+                # 考虑添加thing_queries
+                 
 
         return queries, pe_features, mpe, sem_preds
 
@@ -454,7 +460,7 @@ class PFC(nn.Module):
         num_samples = num_pos + num_neg
         num_points = positive_gt_masks.shape[-1]
         labels = positive_gt_masks.new_full((num_samples, ),
-                                            len(self.total_class),
+                                            self.ignore_index,
                                             dtype=torch.long)
         label_weights = positive_gt_masks.new_zeros(num_samples,
                                                     len(self.total_class))
@@ -475,7 +481,7 @@ class PFC(nn.Module):
 
         if gt_sem_masks is not None and gt_sem_classes is not None:
             sem_labels = positive_gt_masks.new_full((len(self.stuff_class), ),
-                                                    len(self.total_class),
+                                                    self.ignore_index,
                                                     dtype=torch.long)
             sem_targets = positive_gt_masks.new_zeros(len(self.stuff_class),
                                                       num_points)
@@ -554,7 +560,7 @@ class PFC(nn.Module):
         return (labels, masks)
     
     def bipartite_matching(self, class_preds, mask_preds, pos_mask_preds, batch_data_samples,text_features):
-        gt_classes, gt_masks = self.generate_mask_class_target(batch_data_samples) # [7] [19,41589]
+        gt_classes, gt_masks = self.generate_mask_class_target(batch_data_samples) # [7] [7,41589]
 
         gt_thing_classes = []
         gt_thing_masks = []
@@ -576,14 +582,14 @@ class PFC(nn.Module):
 
         sampling_results = []
         for b in range(len(mask_preds[0])):
-            thing_masks_pred_detach = mask_preds[0][b][:self.num_queries,:].detach()
+            thing_masks_pred_detach = mask_preds[0][b][:self.num_queries,:].detach() # [128, 8916]
             # 取可见的部分
             grid_mask = batch_data_samples['grid_mask'][b]
-            thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[grid_mask].permute(1,0)
+            thing_masks_pred_detach = thing_masks_pred_detach.permute(1,0)[grid_mask].permute(1,0) # [128, 8916]
             
             sampled_gt_instances = InstanceData(
                 labels=gt_thing_classes[b], masks=gt_thing_masks[b])
-            sampled_pred_instances = InstanceData(masks=thing_masks_pred_detach)
+            sampled_pred_instances = InstanceData(masks=thing_masks_pred_detach) # [128, 8916]
 
             assign_result = self.zero_assigner.assign(
                 sampled_pred_instances,
@@ -628,7 +634,7 @@ class PFC(nn.Module):
                                                       sampled_pred_instances,
                                                       sampled_gt_instances)
                 sampling_results.append(sampling_result)
-
+            # 修改添加thing_mask
             cls_targets, mask_targets, label_weights, _ = self.get_targets(sampling_results, gt_stuff_masks, gt_stuff_classes)
             cls_targets_buffer.append(cls_targets)
             mask_targets_buffer.append(mask_targets)
@@ -651,7 +657,10 @@ class PFC(nn.Module):
         semantic_preds = []
         instance_ids = []
         for i in range(len(class_preds)):
-            class_pred = F.softmax(class_preds[i] , dim=-1)
+            if self.geometric_ensemble:
+                class_pred = F.softmax(class_preds[i] , dim=-1)
+            else:
+                class_pred = class_preds[i]
             mask_pred = mask_preds[i]
 
             scores = class_pred[:self.num_queries][:, self.thing_class] # 139 = 128+num_class
@@ -735,7 +744,7 @@ class PFC(nn.Module):
             losses[f'loss_cls_{layer}'] = self.loss_cls(
                 class_preds, # [133, 12]
                 class_targets, # [133]
-                label_weights,
+                label_weights, # [133, 13]
                 avg_factor=avg_factor,
                 reduction_override=reduction_override)
 
@@ -805,8 +814,9 @@ class PFC(nn.Module):
     def forward(self, train_dict):
         clip_voxel_features, voxel_coors = self.voxelize_clip_features(train_dict)
         text_features = train_dict['text_features'][0].float() # [13, 768]
-        voxel_features = self.pe_vision_proj(clip_voxel_features) # [V，256]
-        masked_voxel_features = self.mask_features(voxel_features.unsqueeze(1)).squeeze(1)
+        masked_voxel_features = self.mask_features(clip_voxel_features.unsqueeze(0).transpose(1, 2)).squeeze(0).transpose(0,1)
+        masked_voxel_features = self.pe_vision_proj(masked_voxel_features) # [V，256]
+
         # add void class weight
         # text_features = torch.cat([text_features,F.normalize(self.void_embedding.weight,dim=-1)],dim=0)
         class_preds_buffer, mask_preds_buffer, pos_mask_preds_buffer, sem_preds = self.forward_vision_features(masked_voxel_features,voxel_coors,text_features)
@@ -838,29 +848,35 @@ class PFC(nn.Module):
             class_results_buffer = []
             clip_feature_split = []
             voxel_coor_split = []
-            for i in range(batch_size):
-                clip_feature_split.append(clip_voxel_features[voxel_coors[:, 0] == i])
-                voxel_coor_split.append(voxel_coors[voxel_coors[:, 0] == i])
-            for b in range(batch_size):
-                clip_feature = clip_feature_split[b].transpose(0,1).unsqueeze(0).unsqueeze(3) # [V, 1536]
-                mask_cls = mask_cls_results[b] #  [134,768] [embed_dim+len(self.stuff_class),text_features]
-                mask_for_pooling = mask_pred_results[b].unsqueeze(0).unsqueeze(3)  # [134,12826]
-                pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling).squeeze(0)
-                in_vocabulary_class_preds = get_classification_logits(mask_cls, text_features, self.logit_scale) # [134, 17]
-                out_vocabulary_class_preds = get_classification_logits(pooled_clip_feature,text_features,self.logit_scale)
-                # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
-                in_vocabulary_class_preds = in_vocabulary_class_preds.softmax(-1)
-                out_vocabulary_class_preds = out_vocabulary_class_preds.softmax(-1)
-                cls_logits_seen = (
-                    (in_vocabulary_class_preds ** (1 - alpha) * out_vocabulary_class_preds**alpha)
-                    * category_overlapping_mask
-                )
-                cls_logits_unseen = (
-                    (in_vocabulary_class_preds ** (1 - beta) * out_vocabulary_class_preds**beta)
-                    * (~ category_overlapping_mask)
-                ) 
-                cls_results = cls_logits_seen + cls_logits_unseen
-                class_results_buffer.append(cls_results)
+            if self.geometric_ensemble:
+                for i in range(batch_size):
+                    clip_feature_split.append(clip_voxel_features [voxel_coors[:, 0] == i])
+                    voxel_coor_split.append(voxel_coors[voxel_coors[:, 0] == i])
+                for b in range(batch_size):
+                    clip_feature = clip_feature_split[b].transpose(0,1).unsqueeze(0).unsqueeze(3) # [V, 1536]
+                    mask_cls = mask_cls_results[b] #  [134,768] [embed_dim+len(self.stuff_class),text_features]
+                    mask_for_pooling = mask_pred_results[b].unsqueeze(0).unsqueeze(3)  # [134,12826]
+                    pooled_clip_feature = self.mask_pooling(clip_feature, mask_for_pooling).squeeze(0)
+                    in_vocabulary_class_preds = get_classification_logits(mask_cls, text_features, self.logit_scale) # [134, 17]
+                    out_vocabulary_class_preds = get_classification_logits(pooled_clip_feature,text_features,self.logit_scale)
+                    # Reference: https://github.com/NVlabs/ODISE/blob/main/odise/modeling/meta_arch/odise.py#L1506
+                    in_vocabulary_class_preds = in_vocabulary_class_preds.softmax(-1)
+                    out_vocabulary_class_preds = out_vocabulary_class_preds.softmax(-1)
+                    cls_logits_seen = (
+                        (in_vocabulary_class_preds ** (1 - alpha) * out_vocabulary_class_preds**alpha).log()
+                        * category_overlapping_mask
+                    )
+                    cls_logits_unseen = (
+                        (in_vocabulary_class_preds ** (1 - beta) * out_vocabulary_class_preds**beta).log()
+                        * (~ category_overlapping_mask)
+                    ) 
+                    cls_results = cls_logits_seen + cls_logits_unseen
+                    class_results_buffer.append(cls_results)
+            else:
+                for b in range(batch_size):
+                    mask_cls = mask_cls_results[b]
+                    class_preds = get_classification_logits(mask_cls, text_features, self.logit_scale)
+                    class_results_buffer.append(class_preds)
                 
             semantic_preds, instance_ids = self.generate_panoptic_results(class_results_buffer, mask_pred_results)
             semantic_preds = torch.cat(semantic_preds)

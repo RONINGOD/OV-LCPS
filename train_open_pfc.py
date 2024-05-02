@@ -15,10 +15,11 @@ from timm.scheduler import CosineLRScheduler # 0.4.12
 from mmengine.optim import CosineAnnealingParamScheduler
 from utils.AppLogger import AppLogger
 import torch.optim as optim
-from network.PFC import PFC
+# from network.PFC import PFC
+from network.Nus_PFC import PFC
 from network.P3Former import P3Former
 from nuscenes import NuScenes
-from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset,close_spherical_dataset
+from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset,close_spherical_dataset,Close_Nuscenes_pt
 import warnings
 warnings.filterwarnings("ignore")
 from mmengine import ProgressBar
@@ -104,7 +105,7 @@ def main(local_rank, args):
     unique_label, unique_label_str = collate_dataset_info(cfg)
     # 加noise类 
     nclasses = len(unique_label) + 1
-    my_model = P3Former(cfg, 13)
+    my_model = PFC(cfg, nclasses)
     my_model.init_weights()
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params: {n_parameters}')
@@ -214,8 +215,8 @@ def main(local_rank, args):
     }
     avg_loss = 0.0
     to_cuda_list = ['voxel2point_map','point2voxel_map','pol_voxel_ind','grid_mask',
-                    'voxel_instance_labels','point_mask','clip_features','text_features','return_fea']
-        
+                    'voxel_instance_labels','point_mask','clip_features','text_features']
+    
     while epoch < cfg['model']['max_epoch']:
         if start_train:
             if local_rank < 1:
@@ -237,12 +238,12 @@ def main(local_rank, args):
             time_s = time.time()
             bar = tqdm(total=len(train_dataset_loader))
 
-            get_model(my_model).label_map = transform_map(np.hstack([0,train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list,train_pt_dataset.novel_thing_list,train_pt_dataset.novel_stuff_list]))
+            get_model(my_model).label_map = transform_map(np.hstack([0,val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list,val_pt_dataset.novel_thing_list,val_pt_dataset.novel_stuff_list]))
             get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
-            get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.thing_list))
-            get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
-            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list])))
-            get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
+            get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(train_pt_dataset.thing_list))
+            get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(train_pt_dataset.stuff_list))
+            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list])))
+            get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(1,True,dtype=bool),np.full(len(train_pt_dataset.base_thing_list+train_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool))))
             # if distributed:
             #     torch.distributed.barrier()
             for i_iter, data in enumerate(train_dataset_loader):
@@ -344,9 +345,8 @@ def main(local_rank, args):
         get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
         get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.thing_list))
         get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
-        get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list])))
-
-        # get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
+        get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list])))
+        get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.hstack((np.full(1,True,dtype=bool),np.full(len(val_pt_dataset.base_thing_list+val_pt_dataset.base_stuff_list), True, dtype=bool),np.full(len(val_pt_dataset.novel_thing_list+val_pt_dataset.novel_stuff_list),False,dtype=bool))))
 
         with torch.no_grad():
             logger.info("epoch: %d   lr: %.5f\n" % (epoch, optimizer.param_groups[0]['lr']))
@@ -522,4 +522,4 @@ if __name__ == '__main__':
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
 # python train_ov_pfc_spawn.py --launcher pytorch -c configs/open_pa_po_nuscenes_mini.yaml -w work_dir/nusc_pfc/mini
 # python train_openseg_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes.yaml -w work_dir/nusc_pfc/
-# python train_p3former.py --launcher pytorch -c configs/pa_po_nuscenes_p3former.py -w work_dir/nusc_p3former
+# python train_open_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes_pfc.py -w work_dir/nusc_pfc_v2

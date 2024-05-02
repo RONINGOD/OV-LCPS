@@ -370,10 +370,11 @@ class Nuscenes_pt(data.Dataset):
             panoptic_labels_filename = os.path.join(self.nusc.dataroot,
                                                     self.nusc.get('panoptic', lidar_sd_token)['filename'])
             panoptic_label = np.load(panoptic_labels_filename)['data']
-            points_label = np.fromfile(lidarseg_labels_filename, dtype=np.uint8).reshape([-1, 1])
+            # points_label = np.fromfile(lidarseg_labels_filename, dtype=np.uint8).reshape([-1, 1])
+            points_label = panoptic_label // 1000 
             points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
-            noise_mask = points_label == 0
-            points_label[noise_mask] = 17
+            # noise_mask = points_label == 0
+            # points_label[noise_mask] = 17
             data_tuple += (points_label.astype(np.uint8), panoptic_label)
         else:
             data_tuple += (-1, -1)
@@ -431,6 +432,10 @@ class OV_Nuscenes_pt(data.Dataset):
             self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
         else:
             self.text_features = np.load(os.path.join(self.clip_features_path,'total_text_features.npy'))
+            #####
+            # self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
+            # self.thing_list = self.base_thing_list
+            # self.stuff_list = self.base_stuff_list 
             
                                          
         # 多模态
@@ -557,7 +562,155 @@ class OV_Nuscenes_pt(data.Dataset):
             points_label = panoptic_label // 1000 
             points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
             # noise_mask = points_label == 0
+            
             unseenmask = np.isin(points_label,self.unseen_class)
+            # unseenmask = np.full(points_label.shape[0],False,dtype=bool)
+            unseenmask = unseenmask.reshape((points_label.shape[0],1))
+            # points_label[noise_mask] = 17
+            data_tuple += (points_label.astype(np.uint8), panoptic_label,unseenmask)
+        else:
+            data_tuple += (-1, -1,-1)
+
+        # data_tuple = (points[:, :3], points[:, 3], points_label.astype(np.uint8), panoptic_label)
+        if self.pix_fusion:
+            data_tuple += (fusion_tuple,)
+
+        return data_tuple
+
+class Close_Nuscenes_pt(data.Dataset):
+    def __init__(self, data_path, split, cfgs, nusc, version, assync_compensation=True):
+        with open("nuscenes.yaml", 'r') as stream:
+            nuscenesyaml = yaml.safe_load(stream)
+        sample_pkl_path = cfgs['dataset']['sample_pkl_path']
+
+        if version == 'v1.0-mini':
+            if split == 'train':
+                imageset = os.path.join(sample_pkl_path, "nuscenes_infos_train_mini.pkl")
+            elif split == 'val':
+                imageset = os.path.join(sample_pkl_path, "nuscenes_infos_val_mini.pkl")
+        elif version == 'v1.0-trainval':
+            if split == 'train':
+                imageset = os.path.join(sample_pkl_path, "nuscenes_infos_train.pkl")
+            elif split == 'val':
+                imageset = os.path.join(sample_pkl_path, "nuscenes_infos_val.pkl")
+        elif version == 'v1.0-test':
+            imageset = os.path.join(sample_pkl_path, "nuscenes_infos_test.pkl")
+        else:
+            raise NotImplementedError
+
+        with open(imageset, 'rb') as f:
+            data = pickle.load(f)
+
+        self.learning_map = nuscenesyaml['learning_map']
+        self.clip_features_path = cfgs['dataset']['clip_feature_path']
+        self.split = split
+        self.thing_list = [cl for cl, is_thing in nuscenesyaml['thing_class'].items() if is_thing]
+        self.stuff_list = [cl for cl, is_stuff in nuscenesyaml['stuff_class'].items() if is_stuff]
+        self.base_thing_list = [cl for cl, is_thing in nuscenesyaml['base_thing_class'].items() if is_thing]
+        self.base_stuff_list = [cl for cl, is_stuff in nuscenesyaml['base_stuff_class'].items() if is_stuff]
+        self.novel_thing_list = [cl for cl, is_thing in nuscenesyaml['novel_thing_class'].items() if is_thing]
+        self.novel_stuff_list = [cl for cl, is_stuff in nuscenesyaml['novel_stuff_class'].items() if is_stuff]
+        self.nusc_infos = data['infos']
+        self.data_path = data_path
+        self.cfgs = cfgs
+        self.nusc = nusc
+        self.version = version
+        self.text_features = None
+        self.unseen_class = []
+        if self.split =='train':
+            # self.thing_list = self.base_thing_list
+            self.text_features = np.load(os.path.join(self.clip_features_path,'base_text_features.npy'))
+            # self.stuff_list = self.base_stuff_list
+            self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
+        else:
+            self.text_features = np.load(os.path.join(self.clip_features_path,'total_text_features.npy'))
+            #####
+            # self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
+            # self.thing_list = self.base_thing_list
+            # self.stuff_list = self.base_stuff_list
+            
+                                         
+        # 多模态
+        self.pix_fusion = self.cfgs['model']['pix_fusion']
+        self.IMAGE_SIZE = (900, 1600)
+        self.transform = transforms.Compose([transforms.Resize(size=[int(x * 0.4) for x in self.IMAGE_SIZE])])
+        self.CAM_CHANNELS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_BACK_LEFT',
+                             'CAM_BACK', 'CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT']
+        self.open_asynchronous_compensation = assync_compensation
+        # corresponding to self.CAM_CHANNELS，fov from https://www.nuscenes.org/nuscenes
+        # 6 * 3 (cosine lowerbound, cosine upperbound, if_front)
+        self.cam_fov = [[-np.cos(11 * math.pi/36), np.cos(11 * math.pi/36), 1], # CAM_FRONT
+                        [np.cos(7 * math.pi /18), 1, 1], # CAM_FRONT_RIGHT
+                        [-1, -np.cos(7 * math.pi / 18), 1], # CAM_FRONT_LEFT
+                        [-0.5, 0.5, -1], # CAM_BACK 120 degrees fov
+                        [-1, -np.cos(7 * math.pi /18), -1], # CAM_BACK_LEFT
+                        [np.cos(7 * math.pi / 18), 1, -1]] #CAM_BACK_RIGHT 
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.nusc_infos)
+
+    def __getitem__(self, index):
+        info = self.nusc_infos[index]
+        lidar_sd_token = self.nusc.get('sample', info['token'])['data']['LIDAR_TOP']
+
+        if self.version == "v1.0-trainval":
+            lidar_path = info['lidar_path'][16:]
+        elif self.version == "v1.0-mini":
+            lidar_path = info['lidar_path'][44:]
+        elif self.version == "v1.0-test":
+            lidar_path = info['lidar_path'][16:]
+            
+        points = np.fromfile(os.path.join(self.data_path, lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])
+        pcd_data_name = lidar_path.split('.')[0]
+        clip_img_features_path = os.path.join(self.clip_features_path,pcd_data_name+'.npy')
+        points_features = np.load(clip_img_features_path,allow_pickle=True).item()
+        clip_features, point_mask = points_features['point_feat'], points_features['point_mask']
+        clip_features = np.array(clip_features).astype('float32')
+        # 多模态部分
+        if self.pix_fusion:
+            camera_channel = []  # 6, H, W, 3
+            lidar_token = lidar_sd_token
+            lidar_channel = self.nusc.get("sample_data", lidar_token)
+            rho = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
+            # cosine_value = points[:, 0] / rho
+            
+            for idx, channel in enumerate(self.CAM_CHANNELS):
+                cam_token = info['cams'][channel]['sample_data_token']
+                cam_channel = self.nusc.get('sample_data', cam_token)
+                # fcclip_version_features = np.load(os.path.join(self.fcclip_features_path,cam_channel['filename'].split('.')[0]+'.npy'))
+                im = Image.open(os.path.join(self.nusc.dataroot, cam_channel['filename'])).convert('RGB')
+                camera_channel.append(np.array(self.transform(im)).astype('float32'))
+            for i in range(6):
+                # 归一化
+                camera_channel[i] /= 255.0
+                camera_channel[i][:, :, 0] = (camera_channel[i][:, :, 0] - 0.485) / 0.229
+                camera_channel[i][:, :, 1] = (camera_channel[i][:, :, 1] - 0.456) / 0.224
+                camera_channel[i][:, :, 2] = (camera_channel[i][:, :, 2] - 0.406) / 0.225
+            camera_channel = np.stack(camera_channel, axis=0)
+            # pixel_coordinates = np.stack(pixel_coordinates, axis=0)
+            # masks = np.stack(masks, axis=0)
+            fusion_tuple = (camera_channel, clip_features,point_mask)
+
+        
+        data_tuple = (points[:, :3], points[:, 3], lidar_sd_token)
+        
+        # load label
+        if self.version != "v1.0-test":
+            lidarseg_labels_filename = os.path.join(self.nusc.dataroot,
+                                                    self.nusc.get('lidarseg', lidar_sd_token)['filename'])
+            panoptic_labels_filename = os.path.join(self.nusc.dataroot,
+                                                    self.nusc.get('panoptic', lidar_sd_token)['filename'])
+            panoptic_label = np.load(panoptic_labels_filename)['data']
+            # semantic
+            # points_label = np.fromfile(lidarseg_labels_filename, dtype=np.uint8).reshape([-1, 1])
+            # panoptic 
+            points_label = panoptic_label // 1000 
+            points_label = np.vectorize(self.learning_map.__getitem__)(points_label)
+            # noise_mask = points_label == 0
+            
+            unseenmask = np.isin(points_label,self.unseen_class)
+            # unseenmask = np.full(points_label.shape[0],False,dtype=bool)
             unseenmask = unseenmask.reshape((points_label.shape[0],1))
             # points_label[noise_mask] = 17
             data_tuple += (points_label.astype(np.uint8), panoptic_label,unseenmask)
@@ -968,18 +1121,9 @@ class ov_spherical_dataset(data.Dataset):
         
         # 索引clip vision features fusion_tuple = (camera_channel, valid_mask, ori_clip_vision_channel,clip_features)
         camera_channel,clip_features,point_mask = fusion_tuple    
-        # img_indices_channel = []
-        # point2img_index_channel = []
+
         pts_instance_mask = insts[seenmask]
         pts_semantic_mask = labels[seenmask]
-        # for idx in range(len(pixel_coordinates)):
-        #     points_img = np.ascontiguousarray(pixel_coordinates[idx])
-        #     points_img = points_img[camera_masks[idx]]
-        #     img_indices = np.fliplr(points_img.astype(np.int64))
-        #     point2img_index = np.arange(len(camera_masks[idx]))[camera_masks[idx]]
-        #     img_indices_channel.append(img_indices)
-        #     point2img_index_channel.append(point2img_index)
-        #     pixel_coordinates[idx]
         
         if type(labels)==np.ndarray and type(insts)==np.ndarray:
             # 生成每个voxel的语义label，单个网格内采用最大投票
@@ -1055,6 +1199,236 @@ class ov_spherical_dataset(data.Dataset):
 
         return return_dict
 
+class close_spherical_dataset(data.Dataset):
+    def __init__(self, in_dataset, cfgs, ignore_label=0, fixed_volume_space=True, use_aug=True):
+        'Initialization'
+        self.point_cloud_dataset = in_dataset
+        self.grid_size = np.asarray(cfgs['dataset']['grid_size'])
+        self.rotate_aug = cfgs['dataset']['rotate_aug'] if use_aug else False
+        self.flip_aug = cfgs['dataset']['flip_aug'] if use_aug else False
+        self.ignore_label = ignore_label
+        self.fixed_volume_space = fixed_volume_space
+        self.max_volume_space = cfgs['dataset']['max_volume_space']
+        self.min_volume_space = cfgs['dataset']['min_volume_space']
+        self.inst_aug=("inst_aug" in cfgs['dataset']) and ("if_use" in cfgs['dataset']['inst_aug']) and \
+            cfgs['dataset']['inst_aug']['if_use'] if use_aug else False
+        
+
+        self.panoptic_proc = PanopticLabelGenerator(self.grid_size, sigma=cfgs['dataset']['gt_generator']['sigma'],
+                                                    polar=True)
+
+        ### add instance augmentation ###
+        if self.inst_aug:
+            assert ("aug_type" in cfgs['dataset']['inst_aug'])
+            assert ("inst_pkl_path" in cfgs['dataset']['inst_aug'])
+            assert ("inst_trans" in cfgs['dataset']['inst_aug'])
+            assert ("inst_rotate" in cfgs['dataset']['inst_aug'])
+            assert ("inst_flip" in cfgs['dataset']['inst_aug'])
+            assert ("inst_add" in cfgs['dataset']['inst_aug'])
+            thing_list = self.point_cloud_dataset.thing_list
+            if cfgs['dataset']['inst_aug']['aug_type'] == "contmix":
+                self.copy_paste = Cont_Mix_InstAugmentation(dataset_name=cfgs["dataset"]["name"],
+                                instance_pkl_path=cfgs['dataset']['inst_aug']['inst_pkl_path'],
+                                thing_list= thing_list,
+                                class_weight=None,
+                                random_trans=cfgs['dataset']['inst_aug']['inst_trans'],
+                                random_flip=cfgs['dataset']['inst_aug']['inst_flip'],
+                                random_rotate=cfgs['dataset']['inst_aug']['inst_rotate']
+                                )
+            else:
+                self.copy_paste = Instance_Augmentation(instance_pkl_path=cfgs['dataset']['inst_aug']['inst_pkl_path'],
+                                                    thing_list=thing_list,
+                                                    class_weight=None,
+                                                    random_flip=cfgs['dataset']['inst_aug']['inst_flip'],
+                                                    random_add=cfgs['dataset']['inst_aug']['inst_add'],
+                                                    random_rotate=cfgs['dataset']['inst_aug']['inst_rotate'])
+        else:
+            self.inst_aug = None
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.point_cloud_dataset)
+
+    def __getitem__(self, index):
+        'Generates one sample of data'
+        # index = 8709
+        data = self.point_cloud_dataset[index]
+        if len(data) == 6:
+            xyz, feat, token, labels, insts,unseenmask = data # insts -> panoptic label
+            fusion_tuple = None
+            if len(feat.shape) == 1: feat = feat[..., np.newaxis]
+        elif len(data) == 7:
+            xyz, feat, token, labels, insts, unseenmask,fusion_tuple = data
+            if len(feat.shape) == 1: feat = feat[..., np.newaxis]
+        else:
+            raise Exception('Return invalid data tuple')
+        
+        seenmask = np.logical_not(unseenmask)
+
+        if type(labels)==np.ndarray:
+            if len(labels.shape) == 1: labels = labels[..., np.newaxis]
+            if len(insts.shape) == 1: insts = insts[..., np.newaxis]
+
+        # copy-paste数据增强
+        if self.inst_aug:
+            old_xyz_number = xyz.shape[0]
+            # Note: 此处的点云的labels, 已经把noise移动到最后一类，但是所有类别都没有-1.
+            xyz, labels, insts, feat = self.copy_paste.instance_aug(
+                                            point_xyz=xyz,
+                                            point_label=labels,
+                                            point_inst=insts,
+                                            point_feat=feat)
+            # Currently for pasted points, we do not align them to camera features
+            # TODO: Support the image alignment for pasted points, refer to PointAugmenting
+            # url: https://github.com/VISION-SJTU/PointAugmenting
+            if fusion_tuple is not None:
+                _, pixel_coordinates, masks, valid_mask, _ = fusion_tuple
+                add_number = xyz.shape[0] - old_xyz_number
+                pixel_coordinates = np.pad(pixel_coordinates, ((0, 0), (0, add_number), (0,0)), 'constant', constant_values=0)
+                masks = np.pad(masks, ((0, 0), (0, add_number)), 'constant', constant_values=False)
+                valid_mask = np.pad(valid_mask, ((0, add_number)), 'constant', constant_values=-1)
+                fusion_tuple = (fusion_tuple[0], pixel_coordinates, masks, valid_mask, fusion_tuple[4])
+
+        # 逆时针旋转，保存角度
+        rotate_deg = 0
+        if self.rotate_aug:
+            #offset_aug2
+            x_offset = np.random.random() * 2 * 2 - 2
+            y_offset = np.random.random() * 2 * 2 - 2
+            xyz[:,0] = xyz[:,0] + x_offset
+            xyz[:, 1] = xyz[:, 1] + y_offset
+
+
+            rotate_deg = np.random.random() * 360
+            rotate_rad = np.deg2rad(rotate_deg)
+            c, s = np.cos(rotate_rad), np.sin(rotate_rad)
+            j = np.matrix([[c, s], [-s, c]])
+            xyz[:, :2] = np.dot(xyz[:, :2], j)
+
+
+        # 随机翻转
+        if self.flip_aug:
+            flip_type = np.random.choice(3, 1)
+            if flip_type == 1:
+                xyz[:, 0] = -xyz[:, 0]
+                if len(data) == 6:
+                    img = fusion_tuple[0]
+                    img = img[:, :, ::-1, :]
+                    fusion_tuple = (img, fusion_tuple[1],fusion_tuple[2])
+            elif flip_type == 2:
+                xyz[:, 1] = -xyz[:, 1]
+                if len(data) == 6:
+                    img = fusion_tuple[0]
+                    img = img[:, :, ::-1, :]
+                    fusion_tuple = (img, fusion_tuple[1],fusion_tuple[2])
+        # fusion_tuple = (camera_channel, pixel_coordinates, masks, valid_mask, ori_clip_vision_channel)
+        # 转化成极坐标系
+        xyz_pol = cart2polar(xyz) # r ,theti ,z
+
+        # 统一使用预先定义好的坐标范围
+        if self.fixed_volume_space:
+            max_bound = np.asarray(self.max_volume_space)
+            min_bound = np.asarray(self.min_volume_space)
+        else:
+            max_bound_r = np.percentile(xyz_pol[:, 0], 100, axis=0)
+            min_bound_r = np.percentile(xyz_pol[:, 0], 0, axis=0)
+            max_bound = np.max(xyz_pol[:, 1:], axis=0)
+            min_bound = np.min(xyz_pol[:, 1:], axis=0)
+            max_bound = np.concatenate(([max_bound_r], max_bound))
+            min_bound = np.concatenate(([min_bound_r], min_bound))
+
+        # 把点转换成其对应的网格坐标，其中加一个1e-8是为了clip后的点，边界上不会越界
+        crop_range = max_bound - min_bound
+        intervals = crop_range / (self.grid_size-1)
+        # min_bound = min_bound + [1e-8, 1e-8, 1e-8]
+        if (intervals == 0).any(): print("Zero interval!")
+        grid_ind = (np.floor((np.clip(xyz_pol, min_bound, max_bound) - min_bound) / intervals)).astype(int) # 每个点是属于哪个格子
+        unique_grid_ind,point2voxel_map,voxel2point_map = np.unique(grid_ind,axis=0,return_index=True,return_inverse=True) # 体素化后去重的索引
+
+        # 每个网格的起始角落在真实坐标系下的绝对位置
+        dim_array = np.ones(len(self.grid_size) + 1, int)
+        dim_array[0] = -1
+        voxel_position = np.indices(self.grid_size) * intervals.reshape(dim_array) + min_bound.reshape(dim_array)
+        
+        # 索引clip vision features fusion_tuple = (camera_channel, valid_mask, ori_clip_vision_channel,clip_features)
+        camera_channel,clip_features,point_mask = fusion_tuple    
+        seenmask = np.full(labels.shape,True,dtype=bool)
+        pts_instance_mask = insts[seenmask]
+        pts_semantic_mask = labels[seenmask]
+        
+        if type(labels)==np.ndarray and type(insts)==np.ndarray:
+            # 生成每个voxel的语义label，单个网格内采用最大投票
+            num_points = pts_instance_mask.shape[0]
+            total_unq = np.unique(grid_ind, axis=0)
+            unq,seen_unique_indices, unique_indices_inverse = np.unique(grid_ind[seenmask[:,0]], return_inverse=True,return_index=True, axis=0)
+            # 寻找索引
+            structured_total_unq = np.core.records.fromarrays(total_unq.transpose())
+            # Create a structured array for unq
+            structured_unq = np.core.records.fromarrays(unq.transpose())
+            # Find the indices
+            grid_mask = np.where(np.in1d(structured_total_unq, structured_unq))[0]
+            bool_array = np.zeros(len(total_unq), dtype=bool)
+            bool_array[grid_mask] = True
+            unq2tuple = (unq[:,0],unq[:,1],unq[:,2])
+            unq_instance_labels = np.unique(pts_instance_mask, axis=0).astype(np.int32)
+            sort_instance_labels = np.zeros(pts_instance_mask.shape).astype(np.int32)            # map instance labels to [1 - the number of instances]
+            i = 1
+            ins2sem = np.zeros((len(unq_instance_labels),)).astype(np.int32)
+            for u in unq_instance_labels:
+                valid = pts_instance_mask == u
+                sort_instance_labels[valid] = i
+                ins2sem[i - 1] = pts_semantic_mask[valid][0]
+                i = i + 1
+            flatten_inst_labels = np.zeros(
+                    (num_points, i))  # i: instance number+1(background)
+            flatten_inst_labels[list(range(0, num_points)),
+                                sort_instance_labels[list(range(0, num_points))]] += 1 # 前景背景就分离了
+            flatten_inst_label_sum = torch_scatter.scatter_sum(
+                    torch.from_numpy(flatten_inst_labels), torch.from_numpy(unique_indices_inverse), dim=0).numpy() # 每个点对应实例点数量
+            voxel_instance_labels = np.argmax(flatten_inst_label_sum, axis=1)
+            voxel_semantic_labels = ins2sem[voxel_instance_labels - 1]
+
+
+        # center data on each voxel for PTnet
+        voxel_centers = (grid_ind.astype(np.float32) + 0.5) * intervals + min_bound
+        return_xyz = xyz_pol - voxel_centers
+        return_xyz = np.concatenate((return_xyz, xyz_pol, xyz[:, :2]), axis=1) 
+        return_fea = np.concatenate((return_xyz, feat), axis=1) # pol_xyz_remove center(r,theti,z) 3 |r,theti,z 3| x,y 2| signal 1 9
+
+        # bev_mask = np.zeros((1, 480, 360), dtype=bool)
+        bev_mask = np.zeros((1, self.grid_size[0], self.grid_size[1]), dtype=bool)
+        uni_out = np.unique(grid_ind[:,0:2],axis=0)
+        bev_mask[0, uni_out[:,0], uni_out[:,1]] = True
+
+        return_dict = {}
+        return_dict['lidar_token'] = token
+        return_dict['xyz_cart'] = xyz
+        return_dict['return_fea'] = return_fea
+        return_dict['pol_voxel_ind'] = grid_ind
+        return_dict['rotate_deg'] = rotate_deg
+        return_dict['thing_list'] = self.point_cloud_dataset.thing_list
+        return_dict['stuff_list'] = self.point_cloud_dataset.stuff_list
+        return_dict['text_features'] = self.point_cloud_dataset.text_features
+        return_dict['novel_thing_list'] = self.point_cloud_dataset.novel_thing_list
+        return_dict['novel_stuff_list'] = self.point_cloud_dataset.novel_stuff_list
+        return_dict['pt_sem_label'] = labels
+        return_dict['pt_ins_label'] = insts
+        
+        if type(labels) == np.ndarray and type(insts) == np.ndarray:
+            return_dict['voxel_semantic_labels'] = voxel_semantic_labels
+            return_dict['voxel_instance_labels'] = voxel_instance_labels
+            return_dict['voxel2point_map'] = voxel2point_map
+            return_dict['point2voxel_map'] = point2voxel_map
+            return_dict['seenmask'] = seenmask
+            return_dict['seen_unique_indices'] = seen_unique_indices
+            return_dict['grid_mask'] = bool_array
+
+        if len(data) == 7:
+            return_dict['clip_features'] = clip_features
+            return_dict['camera_channel'] = camera_channel 
+            return_dict['point_mask'] = point_mask       
+
+        return return_dict
 
 @nb.jit('u1[:,:,:](u1[:,:,:],i8[:,:])',nopython=True,  cache=True, parallel=False)
 def nb_process_label(processed_label, sorted_label_voxel_pair):

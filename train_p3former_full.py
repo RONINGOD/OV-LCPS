@@ -18,7 +18,7 @@ import torch.optim as optim
 from network.PFC import PFC
 from network.P3Former import P3Former
 from nuscenes import NuScenes
-from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset,close_spherical_dataset
+from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset,close_spherical_dataset,Close_Nuscenes_pt
 import warnings
 warnings.filterwarnings("ignore")
 from mmengine import ProgressBar
@@ -104,7 +104,7 @@ def main(local_rank, args):
     unique_label, unique_label_str = collate_dataset_info(cfg)
     # 加noise类 
     nclasses = len(unique_label) + 1
-    my_model = P3Former(cfg, 13)
+    my_model = P3Former(cfg, nclasses)
     my_model.init_weights()
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params: {n_parameters}')
@@ -133,13 +133,13 @@ def main(local_rank, args):
     elif datasetname == 'nuscenes':
         nusc = NuScenes(version=version, dataroot=data_path, verbose=True)
         assert version == "v1.0-trainval" or version == "v1.0-mini"
-        train_pt_dataset = OV_Nuscenes_pt(data_path, split='train', cfgs=cfg, nusc=nusc, version=version)
-        val_pt_dataset = OV_Nuscenes_pt(data_path, split='val', cfgs=cfg, nusc=nusc, version=version)
+        train_pt_dataset = Close_Nuscenes_pt(data_path, split='train', cfgs=cfg, nusc=nusc, version=version)
+        val_pt_dataset = Close_Nuscenes_pt(data_path, split='val', cfgs=cfg, nusc=nusc, version=version)
     else:
         raise NotImplementedError
 
-    train_dataset = ov_spherical_dataset(train_pt_dataset, cfg, ignore_label=0)
-    val_dataset = ov_spherical_dataset(val_pt_dataset, cfg, ignore_label=0, use_aug=False)
+    train_dataset = close_spherical_dataset(train_pt_dataset, cfg, ignore_label=0)
+    val_dataset = close_spherical_dataset(val_pt_dataset, cfg, ignore_label=0, use_aug=False)
     collate_fn = collate_fn_OV
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,shuffle=True, drop_last=True)
@@ -239,9 +239,9 @@ def main(local_rank, args):
 
             get_model(my_model).label_map = transform_map(np.hstack([0,train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list,train_pt_dataset.novel_thing_list,train_pt_dataset.novel_stuff_list]))
             get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
-            get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.thing_list))
-            get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
-            get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list])))
+            get_model(my_model).thing_class = np.sort(val_pt_dataset.thing_list)
+            get_model(my_model).stuff_class = np.sort(val_pt_dataset.stuff_list)
+            get_model(my_model).total_class = np.sort(np.hstack([0,train_pt_dataset.base_thing_list,train_pt_dataset.base_stuff_list,train_pt_dataset.novel_thing_list,train_pt_dataset.novel_stuff_list]))
             get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
             # if distributed:
             #     torch.distributed.barrier()
@@ -252,7 +252,7 @@ def main(local_rank, args):
                             data[k][i] = torch.from_numpy(data[k][i]).cuda()
                     else:
                         data[k] = torch.from_numpy(data[k]).cuda()
-                data['voxel_semantic_labels'] = [torch.from_numpy(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(i)).type(torch.LongTensor).cuda() for i in data['voxel_semantic_labels']]
+                data['voxel_semantic_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in data['voxel_semantic_labels']]
             
                 data_time_e = time.time()
                 # with torch.cuda.amp.autocast():
@@ -342,9 +342,9 @@ def main(local_rank, args):
         sem_hist_list = []
         get_model(my_model).label_map = transform_map(np.hstack([0,val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list,val_pt_dataset.novel_thing_list,val_pt_dataset.novel_stuff_list]))
         get_model(my_model).label_inverse_map = inverse_transform(get_model(my_model).label_map)
-        get_model(my_model).thing_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.thing_list))
-        get_model(my_model).stuff_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(val_pt_dataset.stuff_list))
-        get_model(my_model).total_class = np.sort(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(np.hstack([0,val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list])))
+        get_model(my_model).thing_class = np.sort(val_pt_dataset.thing_list)
+        get_model(my_model).stuff_class = np.sort(val_pt_dataset.stuff_list)
+        get_model(my_model).total_class = np.sort(np.hstack([0,val_pt_dataset.base_thing_list,val_pt_dataset.base_stuff_list,val_pt_dataset.novel_thing_list,val_pt_dataset.novel_stuff_list]))
 
         # get_model(my_model).categroy_overlapping_mask = torch.from_numpy(np.full(len(get_model(my_model).total_class),True,dtype=bool))
 
@@ -369,9 +369,9 @@ def main(local_rank, args):
                             data[k][i] = torch.from_numpy(data[k][i]).cuda()
                     else:
                         data[k] = torch.from_numpy(data[k]).cuda()
-                data['voxel_semantic_labels'] = [torch.from_numpy(np.vectorize(get_model(my_model).label_inverse_map.__getitem__)(i)).type(torch.LongTensor).cuda() for i in data['voxel_semantic_labels']]
+                data['voxel_semantic_labels'] = [torch.from_numpy(i).type(torch.LongTensor).cuda() for i in data['voxel_semantic_labels']]
                 predict_labels_sem, pts_instance_preds = my_model(data)
-                predict_labels_sem = [np.vectorize(get_model(my_model).label_map.__getitem__)(sem) for sem in predict_labels_sem]
+                # predict_labels_sem = [np.vectorize(get_model(my_model).label_map.__getitem__)(sem) for sem in predict_labels_sem]
                 val_grid = data['pol_voxel_ind']
                 val_pt_labels = data['pt_sem_label']
                 val_pt_inst = data['pt_ins_label']
@@ -522,4 +522,4 @@ if __name__ == '__main__':
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
 # python train_ov_pfc_spawn.py --launcher pytorch -c configs/open_pa_po_nuscenes_mini.yaml -w work_dir/nusc_pfc/mini
 # python train_openseg_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes.yaml -w work_dir/nusc_pfc/
-# python train_p3former.py --launcher pytorch -c configs/pa_po_nuscenes_p3former.py -w work_dir/nusc_p3former
+# python train_p3former_full.py --launcher pytorch -c configs/pa_po_nuscenes_p3former.py -w work_dir/nusc_p3former_full

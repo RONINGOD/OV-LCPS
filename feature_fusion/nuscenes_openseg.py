@@ -109,10 +109,10 @@ def main(args):
     total = base_total+novel_total
     base_total = ['noise'] + base_total
     total = ['noise'] + total
-    text_features = build_text_embedding(base_total)
-    np.save(os.path.join(output,'base_text_features.npy'),text_features)
-    text_features = build_text_embedding(total)
-    np.save(os.path.join(output,'total_text_features.npy'),text_features)
+    # text_features = build_text_embedding(base_total)
+    # np.save(os.path.join(output,'base_text_features.npy'),text_features)
+    # text_features = build_text_embedding(total)
+    # np.save(os.path.join(output,'total_text_features.npy'),text_features)
     # load the openseg model
     saved_model_path = args.openseg_model
     args.text_emb = None
@@ -157,6 +157,7 @@ def main(args):
         counter = torch.zeros((n_points_cur, 1))
         sum_features = torch.zeros((n_points_cur, args.feat_dim))
         vis_id = torch.zeros((n_points_cur, num_img), dtype=int)
+        # feat_2d_list = torch.zeros((num_img,args.feat_dim,img_size[1],img_size[0]))
         for img_id,cam_name in enumerate(CAM_NAME_LIST):
             cam_token = info['cams'][cam_name]['sample_data_token']
             cam_channel = nusc.get('sample_data', cam_token)
@@ -202,22 +203,25 @@ def main(args):
             # openseg
             feat_2d = extract_openseg_img_feature(
                 img_path, args.openseg_model, args.text_emb, img_size=[img_size[1], img_size[0]])
+            # feat_2d_list[img_id,...]+=feat_2d
             feat_2d_3d = feat_2d[:, mapping_3d[:, 1], mapping_3d[:, 2]].permute(1, 0)
             counter[mask!=0]+= 1
             sum_features[mask!=0] += feat_2d_3d[mask!=0]
-            
+        # feat_2d_list = feat_2d_list.half().numpy()
         counter[counter==0] = 1e-5
         feat_bank = sum_features/counter
         point_ids = torch.unique(vis_id.nonzero(as_tuple=False)[:, 0])
 
         mask = torch.zeros(n_points_cur, dtype=torch.bool)
         mask[point_ids] = True
-        feat_save = feat_bank[mask].numpy()
+        feat_save = feat_bank[mask].half().numpy()
         mask = mask.numpy()
         dir_name = os.path.dirname(img_features_path)
         make_file(dir_name)
         save_dict = {"point_feat": feat_save,
-                     "point_mask": mask}
+                     "point_mask": mask,
+                    #  "img_feat":feat_2d_list
+                     }
         np.save(img_features_path,save_dict)   
         pbar.set_postfix({
             "token":sample_data['token'],

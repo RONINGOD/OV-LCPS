@@ -21,12 +21,13 @@ def freeze_everything(model):
     for param in model.parameters():
         param.requires_grad = False
 
-class PFC(BaseModule):
+class OVPFC(BaseModule):
 
     def __init__(self, cfgs, nclasses,pos_dim=3,use_pa_seg=True,use_sem_loss=True,
                  mask_channels=(256, 256, 256, 256, 256),
                  pa_seg_weight = 0.2,
-                 num_decoder_layers=6,
+                 thing_num_decoder_layers=6,
+                 stuff_num_decoder_layers=6,
                  score_thr = 0.4,
                  iou_thr = 0.8,
                  ignore_index = 0,
@@ -49,12 +50,13 @@ class PFC(BaseModule):
                             dict(type='mmdet.DiceCost', weight=2.0, pred_act=True),
                     ]),
                  transformer_decoder_cfg=dict(type='_Transformer_Decoder'),):
-        super(PFC, self).__init__()
+        super().__init__()
         self.nclasses = nclasses
         self.minpoint = 0
         self.ignore_index = ignore_index
         self.score_thr = score_thr
-        self.num_decoder_layers = num_decoder_layers
+        self.thing_num_decoder_layers = thing_num_decoder_layers
+        self.stuff_num_decoder_layers = stuff_num_decoder_layers
         self.clip_vision_dim = cfgs['model']['clip_vision_dim']
         self.fcclip_text_dim = cfgs['model']['clip_text_dim']
         cls_channels=(256, 256, self.fcclip_text_dim)
@@ -96,18 +98,6 @@ class PFC(BaseModule):
         self.loss_mask = MODELS.build(cfgs['model']['loss_mask'])
         self.loss_dice = MODELS.build(cfgs['model']['loss_dice'])
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
-        # for i in range(self.deconv_layers):
-        #     if i==0 and i==self.deconv_layers-1:
-        #         self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.fcclip_vision_dim,self.fcclip_vision_dim,kernel_size=7,stride=1, padding=3, bias=False))
-        #     elif i==0:
-        #         self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.fcclip_vision_dim,self.deconv_hidden_dim,kernel_size=7,stride=1, padding=3, bias=False))
-        #     elif i==self.deconv_layers-1:
-        #         self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.deconv_hidden_dim,self.fcclip_vision_dim, kernel_size=3, stride=1, padding=1, bias=False)) 
-        #     else:
-        #         self.deconv.add_module(f'conv_{i}',nn.Conv2d(self.deconv_hidden_dim,self.deconv_hidden_dim,kernel_size=7,stride=1, padding=3, bias=False))
-        #     xavier_init(self.deconv[-1])
-        #     self.deconv.add_module(f'act_{i}',nn.ReLU(inplace=True))
-        #     self.deconv.add_module(f'up_{i}', nn.UpsamplingNearest2d(scale_factor=2) if i != self.deconv_layers - 1 else nn.UpsamplingBilinear2d(scale_factor=2))
         self.queries = SubMConv3d(self.query_embed_dims, self.num_queries, indice_key="logit", 
                                     kernel_size=1, stride=1, padding=0, bias=False)
         xavier_init(self.queries)
@@ -120,7 +110,7 @@ class PFC(BaseModule):
             # self.loss_ce = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
             self.loss_lovasz = MODELS.build(dict(type='LovaszLoss',
                                                 reduction='none',))
-        self.sem_queries = nn.Conv3d(self.query_embed_dims, self.fcclip_text_dim, kernel_size=1, stride=1, padding=0, bias=False)
+        self.sem_queries = nn.Conv3d(self.query_embed_dims, self.nclasses, kernel_size=1, stride=1, padding=0, bias=False)
         xavier_init(self.sem_queries)
         self.pre_norm = build_norm_layer(dict(type='BN1d', eps=1e-5, momentum=0.01), self.clip_vision_dim)[1]
         constant_init(self.pre_norm,val=1,bias=0)
@@ -170,9 +160,12 @@ class PFC(BaseModule):
         
         # build transformer decoder            
         transformer_decoder_cfg.update(embed_dims=self.query_embed_dims)
-        self.transformer_decoder = nn.ModuleList()
-        for _ in range(num_decoder_layers):
-            self.transformer_decoder.append(_Transformer_Decoder(transformer_decoder_cfg))
+        self.thing_transformer_decoder = nn.ModuleList()
+        self.stuff_transformer_decoder = nn.ModuleList()
+        for _ in range(thing_num_decoder_layers):
+            self.thing_transformer_decoder.append(_Transformer_Decoder(transformer_decoder_cfg))
+        for _ in range(stuff_num_decoder_layers):
+            self.stuff_transformer_decoder.append(_Transformer_Decoder(transformer_decoder_cfg))
                 
         # build pa_seg
         self.fc_cls = nn.ModuleList()
@@ -183,7 +176,7 @@ class PFC(BaseModule):
             self.fc_coor_mask = nn.ModuleList()
             self.fc_coor_mask.append(MLP(mask_channels))
             self.pa_seg_weight = pa_seg_weight    
-        for _ in range(num_decoder_layers):
+        for _ in range(self.thing_num_decoder_layers):
             self.fc_cls.append(MLP(cls_channels))
             self.fc_mask.append(MLP(mask_channels))
             if use_pa_seg:
@@ -250,7 +243,7 @@ class PFC(BaseModule):
         voxels = []
         coors = []
         for batch in range(B):
-            point_voxel_fea = clip_features[batch].new_ones([pol_voxel_ind_channel[batch].shape[0],self.clip_vision_dim])*1e-8
+            point_voxel_fea = clip_features[batch].new_ones([pol_voxel_ind_channel[batch].shape[0],self.clip_vision_dim])*1e-5
             pol_voxel_ind = pol_voxel_ind_channel[batch]
             point_voxel_fea[point_mask[batch]] = clip_features[batch]
             coors.append(F.pad(pol_voxel_ind, (1, 0), mode='constant', value=batch))
@@ -339,14 +332,18 @@ class PFC(BaseModule):
 
         sem_preds = []
         if self.use_sem_loss:
-            sem_queries = self.sem_queries.weight.clone().squeeze(-1).squeeze(-1).repeat(1,1,batch_size).permute(2,0,1) # [20,256,1,1,1] -> [1,768,256]
-            
+            sem_queries = self.sem_queries.weight.clone().squeeze(-1).squeeze(-1).repeat(1,1,batch_size).permute(2,0,1) # [20,256,1,1,1] -> [1,20,256]
+            sem_queries = self.decoder_norm(sem_queries)
+            sem_queries = self.mask_embed(sem_queries) # [1, 17, 256]
+            outputs_mask = self.mask_proj(sem_queries.transpose(1,2)).transpose(1,2).unsqueeze(3) # [1,256,768]  
+
             for b in range(len(pe_features)):
-                sem_que = torch.einsum("nc,vn->vc", sem_queries[b], text_features) # [768,256]*[13,768] -> [v,n] [13,256]
-                sem_fea = torch.einsum("nc,vc->vn",sem_queries[b],pe_features[b]) # [768,256] [V,256]-> [v,768]
-                sem_pred = get_classification_logits(sem_fea,text_features,self.logit_scale)
+                maskpool_embeddings = self.mask_pooling(x=pe_features[b].unsqueeze(0).unsqueeze(3),mask=outputs_mask[b].unsqueeze(0))
+                maskpool_embeddings = self._mask_pooling_proj(maskpool_embeddings.transpose(1,2)).squeeze(0)
+                sem_pred = get_classification_logits(maskpool_embeddings,text_features,self.logit_scale)
+                # sem_pred = torch.einsum("nc,vc->vn", sem_queries[b], pe_features[b])
                 sem_preds.append(sem_pred)
-                stuff_queries = sem_que[self.stuff_class] # [5,256]
+                stuff_queries = sem_queries[b][self.stuff_class] # [5,256]
                 queries[b] = torch.cat([queries[b], stuff_queries], dim=0) # [133,256]
 
         return queries, pe_features, mpe, sem_preds
@@ -400,8 +397,14 @@ class PFC(BaseModule):
         class_preds_buffer.append(None)
         mask_preds_buffer.append(mask_preds)
         pos_mask_preds_buffer.append(pos_mask_preds)
-        for i in range(self.num_decoder_layers):
-            queries = self.transformer_decoder[i](queries, features, mask_preds) # queries [133,256] features [37510, 256] mask_preds [139, 37510]
+        for i in range(self.thing_num_decoder_layers):
+            thing_queries = [que[:self.num_queries,:] for que in queries]
+            stuff_queries = [que[self.num_queries:,:] for que in queries]
+            thing_mask = [mask[:self.num_queries,:] for mask in mask_preds]
+            stuff_mask = [mask[self.num_queries:,:] for mask in mask_preds]
+            thing_queries = self.thing_transformer_decoder[i](thing_queries, features, thing_mask) # queries [133,256] features [37510, 256] mask_preds [139, 37510]
+            stuff_queries = self.stuff_transformer_decoder[i](stuff_queries, features, stuff_mask) 
+            queries = [torch.cat([thing_queries[i],stuff_queries[i]],dim=0) for i in range(len(thing_queries))]
             class_preds, mask_preds, pos_mask_preds = self.pa_seg(queries, features, mpe, layer=i+1)
             class_preds_buffer.append(class_preds)
             mask_preds_buffer.append(mask_preds)
@@ -601,7 +604,7 @@ class PFC(BaseModule):
         mask_targets_buffer.append(mask_targets)
         label_weights_buffer.append(label_weights)
 
-        for layer in range(self.num_decoder_layers):
+        for layer in range(self.thing_num_decoder_layers):
             sampling_results = []
             for b in range(len(mask_preds[0])):
                 if class_preds[layer] is not None:
@@ -818,7 +821,7 @@ class PFC(BaseModule):
         if self.training:
             cls_targets_buffer, mask_targets_buffer, label_weights_buffer = self.bipartite_matching(class_preds_buffer, mask_preds_buffer, pos_mask_preds_buffer, train_dict,text_features)
             losses = dict()
-            for i in range(self.num_decoder_layers+1):
+            for i in range(self.thing_num_decoder_layers+1):
                 losses.update(self.loss_single_layer(class_preds_buffer[i], mask_preds_buffer[i], pos_mask_preds_buffer[i],
                                                     cls_targets_buffer[i], mask_targets_buffer[i], label_weights_buffer[i], i,train_dict,text_features,sem_preds))
             if self.cal_sem_loss:

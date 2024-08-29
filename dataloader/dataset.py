@@ -425,13 +425,16 @@ class OV_Nuscenes_pt(data.Dataset):
         self.version = version
         self.text_features = None
         self.unseen_class = []
+        self.transfer_list = np.load(os.path.join(self.clip_features_path,'transfer_list.npy'))
         if self.split =='train':
             self.thing_list = self.base_thing_list
             self.text_features = np.load(os.path.join(self.clip_features_path,'base_text_features.npy'))
+            # self.text_features = np.load(os.path.join(self.clip_features_path,'base32_text_features.npy'))
             self.stuff_list = self.base_stuff_list
             self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
         else:
             self.text_features = np.load(os.path.join(self.clip_features_path,'total_text_features.npy'))
+            # self.text_features = np.load(os.path.join(self.clip_features_path,'total44_text_features.npy'))
             #####
             # self.unseen_class = list(set(range(1,len(nuscenesyaml['thing_class'].items()))).difference(set(self.base_stuff_list+self.base_thing_list)))
             # self.thing_list = self.base_thing_list
@@ -1182,6 +1185,7 @@ class ov_spherical_dataset(data.Dataset):
         return_dict['novel_stuff_list'] = self.point_cloud_dataset.novel_stuff_list
         return_dict['pt_sem_label'] = labels
         return_dict['pt_ins_label'] = insts
+        return_dict['transfer_list'] = self.point_cloud_dataset.transfer_list
         
         if type(labels) == np.ndarray and type(insts) == np.ndarray:
             return_dict['voxel_semantic_labels'] = voxel_semantic_labels

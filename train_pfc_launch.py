@@ -15,8 +15,8 @@ from timm.scheduler import CosineLRScheduler # 0.4.12
 from mmengine.optim import CosineAnnealingParamScheduler
 from utils.AppLogger import AppLogger
 import torch.optim as optim
+# from network.PFC import PFC
 from network.PFC import PFC
-# from network.Nus_PFC import PFC
 from network.P3Former import P3Former
 from nuscenes import NuScenes
 from dataloader.dataset import collate_fn_OV, Nuscenes_pt, spherical_dataset, OV_Nuscenes_pt,collate_dataset_info, SemKITTI_pt,ov_spherical_dataset,close_spherical_dataset,Close_Nuscenes_pt
@@ -31,13 +31,32 @@ from utils.metric_util import per_class_iu, fast_hist_crop
 from utils.metric_util import cal_PQ_dagger
 from mmengine import Config
 import pickle
+import datetime
 import shutil
 warnings.filterwarnings("ignore")
 
 def pass_print(*args, **kwargs):
     pass
 
-def main(local_rank, args):
+def main():
+    torch.set_num_threads(6)
+    # Training settings
+    parser = argparse.ArgumentParser(description='')
+    # parser.add_argument('--launcher', choices=['none', 'pytorch'], default='pytorch')
+    parser.add_argument('-c', '--configs', default='configs/open_pa_po_nuscenes_pfc.py')
+    parser.add_argument('-w', '--work_dir', default='work_dir/nusc_pfc_test/')
+    parser.add_argument("--local-rank", default=-1, type=int)
+    parser.add_argument('-r', "--resume", type=str, default='')
+    args = parser.parse_args()
+    print(args)
+    if "WORLD_SIZE" in os.environ.keys() and int(os.environ["WORLD_SIZE"]) > 1:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+        if args.local_rank == 0:
+            print("|| MASTER_ADDR:",os.environ["MASTER_ADDR"],
+                  "|| MASTER_PORT:",os.environ["MASTER_PORT"],
+                  "|| LOCAL_RANK:",os.environ["LOCAL_RANK"],
+                  "|| RANK:",os.environ["RANK"], 
+                  "|| WORLD_SIZE:",os.environ["WORLD_SIZE"])
     # global settings
     torch.backends.cudnn.benchmark = True  # 是否自动加速，自动选择合适算法，false选择固定算法
     torch.backends.cudnn.deterministic = True  # 为了消除该算法本身的不确定性
@@ -46,39 +65,25 @@ def main(local_rank, args):
     cfg =Config.fromfile(args.configs)
     cfg.work_dir = args.work_dir
 
-    # init DDP
-    if args.launcher == 'none':
-        distributed = False
-        rank = 0
-        cfg.gpu_ids = [0]         # debug
-    else:
-        distributed = True
-        seed = 3407
+    # 分布式初始化
+    if args.local_rank != -1:
+        seed = 1
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        ip = os.environ.get("MASTER_ADDR", "127.0.0.1")
-        port = os.environ.get("MASTER_PORT", "20506")
-        hosts = int(os.environ.get("WORLD_SIZE", 1))  # number of nodes
-        rank = int(os.environ.get("RANK", 0))  # node id
-        gpus = torch.cuda.device_count()  # gpus per node
-        print(f"tcp://{ip}:{port}")
-        dist.init_process_group(
-            backend="nccl", init_method=f"tcp://{ip}:{port}", 
-            world_size=hosts * gpus, rank=rank * gpus + local_rank
-        )
-        world_size = dist.get_world_size()
-        cfg.gpu_ids = range(world_size)
-        torch.cuda.set_device(local_rank)
 
-        if dist.get_rank() != 0:
-            import builtins
-            builtins.print = pass_print
+        torch.cuda.set_device(args.local_rank)
+        torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=5400))
+        torch.cuda.set_device(args.local_rank)
+
+    if args.local_rank != 0:
+        import builtins
+        builtins.print = pass_print
 
     # configure logger
-    if local_rank == 0 and rank == 0:
+    if args.local_rank < 1:
         os.makedirs(args.work_dir, exist_ok=True)
         cfg.dump(osp.join(args.work_dir, osp.basename(args.configs)))
 
@@ -107,68 +112,20 @@ def main(local_rank, args):
     nclasses = len(unique_label) + 1
     my_model = PFC(cfg, nclasses)
     my_model.init_weights()
-    n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
-    logger.info(f'Number of params: {n_parameters}')
-    logger.info(f'Model:\n{my_model}')
-    if distributed:
+
+    if args.local_rank != -1:
         my_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(my_model)
+    my_model = my_model.cuda()
+    if args.local_rank != -1:
         find_unused_parameters = cfg.get('find_unused_parameters', True)
-        ddp_model_module = torch.nn.parallel.DistributedDataParallel
-        my_model = ddp_model_module(
-            my_model.cuda(),
-            device_ids=[torch.cuda.current_device()],
-            broadcast_buffers=False,
-            find_unused_parameters=find_unused_parameters)
-    else:
-        my_model = my_model.cuda()
-    print('done ddp model')
+        my_model = torch.nn.parallel.DistributedDataParallel(my_model, device_ids=[args.local_rank],
+                                                             output_device=args.local_rank,
+                                                             find_unused_parameters=find_unused_parameters)
+        print('done ddp model')
     # NuScenes: MultiStepLR; SemanticKitti: CosineAnnealingLR, CosineAnnealingWarmRestarts
     optimizer = optim.Adam(my_model.parameters(), lr=lr,weight_decay=0.01)
     scheduler_steplr = MultiStepLR(optimizer, milestones=lr_step, gamma=lr_gamma,)
-    # scheduler_steplr = CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-8, verbose=True)
-    # scheduler_steplr = CosineAnnealingWarmRestarts(optimizer, T_0=5, eta_min=1e-8, verbose=True)
-    
-    if datasetname == 'SemanticKitti':
-        train_pt_dataset = SemKITTI_pt(os.path.join(data_path, 'dataset', 'sequences'), cfg, split='train', return_ref=True)
-        val_pt_dataset = SemKITTI_pt(os.path.join(data_path, 'dataset', 'sequences'), cfg, split='val', return_ref=True)
-    elif datasetname == 'nuscenes':
-        nusc = NuScenes(version=version, dataroot=data_path, verbose=True)
-        assert version == "v1.0-trainval" or version == "v1.0-mini"
-        train_pt_dataset = OV_Nuscenes_pt(data_path, split='train', cfgs=cfg, nusc=nusc, version=version)
-        val_pt_dataset = OV_Nuscenes_pt(data_path, split='val', cfgs=cfg, nusc=nusc, version=version)
-    else:
-        raise NotImplementedError
 
-    train_dataset = ov_spherical_dataset(train_pt_dataset, cfg, ignore_label=0)
-    val_dataset = ov_spherical_dataset(val_pt_dataset, cfg, ignore_label=0, use_aug=False)
-    collate_fn = collate_fn_OV
-    if distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,shuffle=True, drop_last=True)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False,drop_last=False)
-    else:
-        sampler = None
-        val_sampler = None
-    train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                                       batch_size=train_batch_size,
-                                                       collate_fn=collate_fn,
-                                                       pin_memory=True,
-                                                       sampler=sampler,
-                                                       num_workers=num_worker)
-    val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
-                                                     batch_size=val_batch_size,
-                                                     collate_fn=collate_fn,
-                                                     pin_memory=True,
-                                                     sampler=val_sampler,
-                                                     num_workers=num_worker)
-    if datasetname == 'nuscenes':
-        with open("nuscenes.yaml", 'r') as stream:
-            nuscenesyaml = yaml.safe_load(stream)
-    learning_map = nuscenesyaml['learning_map']
-    # resume and load
-    epoch = 0
-    best_miou, best_pq = 0.0, 0.0
-    global_iter = 0
-    print_freq = cfg.model.print_freq
     cfg.resume = ''
     if osp.exists(osp.join(osp.abspath(args.work_dir), 'latest.pth')):
         cfg.resume = osp.join(osp.abspath(args.work_dir), 'latest.pth')
@@ -177,7 +134,7 @@ def main(local_rank, args):
     
     print('resume from: ', cfg.resume)
     print('work dir: ', args.work_dir)
-    start_train = True
+
     if cfg.resume and osp.exists(cfg.resume):
         map_location = 'cpu'
         ckpt = torch.load(cfg.resume, map_location=map_location)
@@ -204,6 +161,56 @@ def main(local_rank, args):
             state_dict = revise_ckpt_2(state_dict)
             print(my_model.load_state_dict(state_dict, strict=False))
         
+    n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
+    logger.info(f'Number of params: {n_parameters}')
+    logger.info(f'Model:\n{my_model}')
+
+    # scheduler_steplr = CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-8, verbose=True)
+    # scheduler_steplr = CosineAnnealingWarmRestarts(optimizer, T_0=5, eta_min=1e-8, verbose=True)
+    
+    if datasetname == 'SemanticKitti':
+        train_pt_dataset = SemKITTI_pt(os.path.join(data_path, 'dataset', 'sequences'), cfg, split='train', return_ref=True)
+        val_pt_dataset = SemKITTI_pt(os.path.join(data_path, 'dataset', 'sequences'), cfg, split='val', return_ref=True)
+    elif datasetname == 'nuscenes':
+        nusc = NuScenes(version=version, dataroot=data_path, verbose=True)
+        assert version == "v1.0-trainval" or version == "v1.0-mini"
+        train_pt_dataset = OV_Nuscenes_pt(data_path, split='train', cfgs=cfg, nusc=nusc, version=version)
+        val_pt_dataset = OV_Nuscenes_pt(data_path, split='val', cfgs=cfg, nusc=nusc, version=version)
+    else:
+        raise NotImplementedError
+
+    train_dataset = ov_spherical_dataset(train_pt_dataset, cfg, ignore_label=0)
+    val_dataset = ov_spherical_dataset(val_pt_dataset, cfg, ignore_label=0, use_aug=False)
+    collate_fn = collate_fn_OV
+    if args.local_rank != -1:
+        sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,shuffle=True, drop_last=True)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False,drop_last=False)
+    else:
+        sampler = None
+        val_sampler = None
+    train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
+                                                       batch_size=train_batch_size,
+                                                       collate_fn=collate_fn,
+                                                       pin_memory=True,
+                                                       sampler=sampler,
+                                                       num_workers=num_worker)
+    val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
+                                                     batch_size=val_batch_size,
+                                                     collate_fn=collate_fn,
+                                                     pin_memory=True,
+                                                     sampler=val_sampler,
+                                                     num_workers=num_worker)
+    if datasetname == 'nuscenes':
+        with open("nuscenes.yaml", 'r') as stream:
+            nuscenesyaml = yaml.safe_load(stream)
+    learning_map = nuscenesyaml['learning_map']
+    # resume and load
+    start_train = True
+    epoch = 0
+    best_miou, best_pq = 0.0, 0.0
+    global_iter = 0
+    print_freq = cfg.model.print_freq
+    
 
     evaluator = OV_PanopticEval(nclasses, None, [0], min_points=min_points,offset=2**32)
     loss_fn_dict ={
@@ -219,7 +226,7 @@ def main(local_rank, args):
     
     while epoch < cfg['model']['max_epoch']:
         if start_train:
-            if local_rank < 1:
+            if args.local_rank < 1:
                 print(f"Epoch {epoch} => Start Training...")
             my_model.train()
             
@@ -294,7 +301,7 @@ def main(local_rank, args):
                 time_e = time.time()
 
                 global_iter += 1
-                if i_iter % print_freq == 0 and local_rank == 0:
+                if i_iter % print_freq == 0 and args.local_rank == 0:
                     lr = optimizer.param_groups[0]['lr']
                     logger.info('\n[TRAIN] Epoch %d Iter %5d/%d: Loss: %.3f (%.3f), lr: %.7f, time: %.3f (%.3f)'%(
                         epoch+1, i_iter, len(train_dataset_loader), 
@@ -317,10 +324,12 @@ def main(local_rank, args):
                     "avg_loss": avg_loss})
                 bar.update(1)
             bar.close()
-            if distributed:
+            scheduler_steplr.step()
+            epoch += 1
+            if args.local_rank != -1:
                 torch.distributed.barrier()
             # save checkpoint
-            if local_rank == 0:
+            if args.local_rank < 1:
                 dict_to_save = {
                     'state_dict': my_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -335,8 +344,7 @@ def main(local_rank, args):
                 # dst_file = osp.join(args.work_dir, 'latest.pth')
                 # symlink(save_file_name, dst_file)
             sem_l, class_l, mask_l,dice_l, dice_pos_l = sem_loss,cls_loss,mask_loss,dice_loss,dice_pos_loss
-            scheduler_steplr.step()
-            epoch += 1
+
         # eval
         my_model.eval()
         evaluator.reset()
@@ -351,9 +359,9 @@ def main(local_rank, args):
         with torch.no_grad():
             logger.info("epoch: %d   lr: %.5f\n" % (epoch, optimizer.param_groups[0]['lr']))
 
-            if local_rank < 1:
+            if args.local_rank < 1:
                 print(f"Epoch {epoch} => Start Evaluation...")
-            if local_rank > 0:
+            if args.local_rank > 0:
                 save_dict = {
                     'item1': [],          
                     'item2': [],
@@ -361,6 +369,8 @@ def main(local_rank, args):
                     'item4': [],
                     'item5': [],
                 }
+            if args.local_rank != -1:
+                torch.distributed.barrier()
             val_bar = tqdm(total=len(val_dataset_loader))
             for i_iter_val, data in enumerate(val_dataset_loader):                  
                 for k in to_cuda_list:
@@ -377,7 +387,7 @@ def main(local_rank, args):
                 val_pt_inst = data['pt_ins_label']
                 for count, i_val_grid in enumerate(val_grid):
                     panoptic = pts_instance_preds[count]
-                    if local_rank<1:
+                    if args.local_rank<1:
                         if datasetname == 'SemanticKitti':
                             sem_gt = np.squeeze(val_pt_labels[count])
                             inst_gt = np.squeeze(val_pt_inst[count])      
@@ -401,15 +411,15 @@ def main(local_rank, args):
                             "instance_id": np.unique(panoptic)})
                 val_bar.update(1)
         val_bar.close()
-        if distributed:
+        if args.local_rank!=-1:
             torch.distributed.barrier()
-            if local_rank > 0:
+            if args.local_rank > 0:
                 os.makedirs(osp.join(osp.abspath(args.work_dir),'tmpdir'), exist_ok=True)
                 pickle.dump(save_dict,
-                            open(os.path.join(osp.abspath(args.work_dir),'tmpdir', 'result_part_{}.pkl'.format(local_rank)), 'wb'))
+                            open(os.path.join(osp.abspath(args.work_dir),'tmpdir', 'result_part_{}.pkl'.format(args.local_rank)), 'wb'))
             torch.distributed.barrier()
-        if local_rank < 1:
-            if local_rank == 0 and distributed:
+        if args.local_rank < 1:
+            if args.local_rank == 0:
                 world_size = torch.distributed.get_world_size()
                 for i in range(world_size - 1):
                     part_file = os.path.join(osp.abspath(args.work_dir),'tmpdir', 'result_part_{}.pkl'.format(i + 1))
@@ -494,9 +504,9 @@ def main(local_rank, args):
             logger.info(
                 'epoch %d iter %5d, avg_loss: %.4f, semantic loss: %.4f, class loss: %.4f, mask_loss: %.4f ,dice loss: %.4f, dice position loss: %.4f\n' %
                 (epoch, i_iter, avg_loss, sem_l, class_l, mask_l, dice_l, dice_pos_l))
-        if distributed:
+        if args.local_rank!=-1:
             torch.distributed.barrier()
-    if distributed:
+    if args.local_rank!=-1:
         torch.distributed.destroy_process_group()
 
             
@@ -504,22 +514,9 @@ def main(local_rank, args):
         
 
 if __name__ == '__main__':
-    # Training settings
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--launcher', choices=['none', 'pytorch'], default='pytorch')
-    parser.add_argument('-c', '--configs', default='configs/pa_po_nuscenes.yaml')
-    parser.add_argument('-w', '--work_dir', default='work_dir/nusc_pfc/')
-    # parser.add_argument("--local-rank", default=-1, type=int)
-    parser.add_argument('-r', "--resume", type=str, default='')
-    args = parser.parse_args()
-    ngpus = torch.cuda.device_count()
-    args.gpus = ngpus
-    print(args)
-    
-    if args.launcher == 'none':
-        main(0, args)
-    else:
-        torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
+    main()
+
 # python train_ov_pfc_spawn.py --launcher pytorch -c configs/open_pa_po_nuscenes_mini.yaml -w work_dir/nusc_pfc/mini
 # python train_openseg_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes.yaml -w work_dir/nusc_pfc/
-# python train_open_pfc.py --launcher pytorch -c configs/open_pa_po_nuscenes_pfc.py -w work_dir/nusc_pfc_v2
+# python train_openseg_pfc.py --launcher pytorch -c configs/open_nusc_pfc_origin.py -w work_dir/nusc_pfc_origin
+# python -m torch.distributed.launch --nproc_per_node=2 --use_env train_pfc_launch.py -c configs/open_nusc_pfc_origin.py -w work_dir/nusc_pfc_launch

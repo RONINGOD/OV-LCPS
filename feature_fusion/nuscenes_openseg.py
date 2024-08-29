@@ -9,6 +9,7 @@ from glob import glob
 from tqdm import tqdm, trange
 import tensorflow as tf2
 import tensorflow.compat.v1 as tf
+import yaml
 # tf.disable_v2_behavior()
 from fusion_util import extract_openseg_img_feature, PointCloudToImageMapper,adjust_intrinsic
 from nuscenes.nuscenes import NuScenes
@@ -47,28 +48,28 @@ def make_file(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-def build_text_embedding(categories):
-    model, preprocess = clip.load("ViT-L/14@336px")
+def build_text_embedding(labelset,model_name="ViT-L/14@336px"):
     run_on_gpu = torch.cuda.is_available()
-
+    print("Loading CLIP {} model...".format(model_name))
+    model, preprocess = clip.load(model_name)
     with torch.no_grad():
-        all_text_embeddings = []
-        print("Building text embeddings...")
-        for category in tqdm(categories):
-            texts = clip.tokenize(category)  #tokenize
-            if run_on_gpu:
-                texts = texts.cuda()
-            text_embeddings = model.encode_text(texts)  #embed with text encoder
-            text_embeddings /= text_embeddings.norm(dim=-1, keepdim=True)
-            text_embedding = text_embeddings.mean(dim=0)
-            text_embedding /= text_embedding.norm()
-            all_text_embeddings.append(text_embedding)
-            
-        all_text_embeddings = torch.stack(all_text_embeddings, dim=1)
+        if isinstance(labelset, str):
+            lines = labelset.split(',')
+        elif isinstance(labelset, list):
+            lines = labelset
+        else:
+            raise NotImplementedError
+        labels = []
+        for line in lines:
+            label = line
+            labels.append(label)
+        text = clip.tokenize(labels)
         if run_on_gpu:
-            all_text_embeddings = all_text_embeddings.cuda()
-    del model
-    return all_text_embeddings.cpu().numpy().T
+            text = text.cuda()
+        text_features = model.encode_text(text)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        del model
+        return text_features.cpu().numpy().T
 
 def main(args):
     seed = 1457
@@ -98,21 +99,60 @@ def main(args):
     CAM_NAME_LIST = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_BACK_LEFT',
                      'CAM_BACK', 'CAM_BACK_RIGHT', 'CAM_FRONT_RIGHT']
     NUSCENES_LABELS_16 = ['barrier', 'bicycle', 'bus', 'car', 'construction vehicle', 'motorcycle', 'person', 'traffic cone',
-                      'trailer', 'truck', 'drivable surface', 'other flat', 'sidewalk', 'terrain', 'manmade', 'vegetation']
-    base_things = ['barrier','bicycle','car','construction_vehicle','traffic_cone',
-                    'trailer','truck']
-    base_stuff = ['driveable_surface','other_flat','sidewalk','terrain','manmade']
-    base_total = base_things+base_stuff
-    novel_things = ['bus','motorcycle','pedestrian']
-    novel_stuff = ['vegetation']
-    novel_total = novel_things+novel_stuff
+                        'trailer', 'truck', 'drivable surface', 'other flat', 'sidewalk', 'terrain', 'manmade', 'vegetation']
+    NUSCENES_LABELS_DETAILS = ['barrier', 'barricade', 'bicycle', 'bus', 'car', 'bulldozer', 'excavator', 'concrete mixer', 'crane', 'dump truck',
+                            'motorcycle', 'person', 'pedestrian','traffic cone', 'trailer', 'semi trailer', 'cargo container', 'shipping container', 'freight container',
+                            'truck', 'road', 'curb', 'traffic island', 'traffic median', 'sidewalk', 'grass', 'grassland', 'lawn', 'meadow', 'turf', 'sod',
+                            'building', 'wall', 'pole', 'awning', 'tree', 'trunk', 'tree trunk', 'bush', 'shrub', 'plant', 'flower', 'woods']
+    with open("nuscenes.yaml", 'r') as stream:
+        nuscenesyaml = yaml.safe_load(stream)
+    base_thing_list = [cl for cl, is_thing in nuscenesyaml['base_thing_class'].items() if is_thing]
+    base_stuff_list = [cl for cl, is_stuff in nuscenesyaml['base_stuff_class'].items() if is_stuff]
+    novel_thing_list = [cl for cl, is_thing in nuscenesyaml['novel_thing_class'].items() if is_thing]
+    novel_stuff_list = [cl for cl, is_stuff in nuscenesyaml['novel_stuff_class'].items() if is_stuff]
+
+    MAPPING_NUSCENES_DETAILS = np.array([0, 0, 1, 2, 3, 4, 4, 4, 4, 4,
+                                5, 6, 6, 7, 8, 8, 8, 8, 8,
+                                9, 10, 11, 11, 11, 12, 13, 13, 13, 13, 13, 13,
+                                14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15])+1
+    base_thing = []
+    base_stuff = []
+    novel_thing = []
+    novel_stuff = []
+    mapping_dict = dict()
+    for i in range(len(NUSCENES_LABELS_DETAILS)):
+        label = NUSCENES_LABELS_DETAILS[i]
+        id = MAPPING_NUSCENES_DETAILS[i]
+        mapping_dict[label] = id
+    for k in mapping_dict.keys():
+        if mapping_dict[k] in base_thing_list:
+            base_thing.append(k)
+        if mapping_dict[k] in base_stuff_list:
+            base_stuff.append(k)
+        if mapping_dict[k] in novel_thing_list:
+            novel_thing.append(k)
+        if mapping_dict[k] in novel_stuff_list:
+            novel_stuff.append(k)
+    base_total = base_thing+base_stuff
+    novel_total = novel_thing+novel_stuff
     total = base_total+novel_total
-    base_total = ['noise'] + base_total
-    total = ['noise'] + total
-    # text_features = build_text_embedding(base_total)
-    # np.save(os.path.join(output,'base_text_features.npy'),text_features)
-    # text_features = build_text_embedding(total)
-    # np.save(os.path.join(output,'total_text_features.npy'),text_features)
+    base_total_add_noise = ['noise'] + base_total
+    total_add_noise = ['noise'] + total
+    transfer_dict = list(np.vectorize(mapping_dict.__getitem__)(total))
+    transfer_dict  = transfer_dict
+    transfer_list = []
+    count = {}
+
+    for num in transfer_dict:
+        if num not in count:
+            count[num] = len(count) + 1
+        transfer_list.append(count[num])
+    transfer_list  = np.array([0]+transfer_list)
+    np.save(os.path.join(output,'transfer_list.npy'),transfer_list)
+    text_features = build_text_embedding(base_total_add_noise)
+    np.save(os.path.join(output,'base32_text_features.npy'),text_features)
+    text_features = build_text_embedding(total_add_noise)
+    np.save(os.path.join(output,'total44_text_features.npy'),text_features)
     # load the openseg model
     saved_model_path = args.openseg_model
     args.text_emb = None
